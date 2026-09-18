@@ -495,7 +495,7 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..70174144baa0682c9bb5f6e49daf4b8819adb3ae 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756df77c9e80 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -668,23 +668,25 @@ def _compute_index_scores(
@@ -833,7 +833,29 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..70174144baa0682c9bb5f6e49daf4b88
  
          return index_scores, topk_indices
  
-@@ -2438,7 +2597,8 @@ class DSAttention(MegatronModule):
+@@ -2382,6 +2541,9 @@ class DSAttention(MegatronModule):
+             assert self.indexer is not None
+             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
+                 q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
++                kpool_gate_score = (
++                    self.indexer._kpool_gate_score if self.indexer.index_kpool > 1 else None
++                )
+                 if cp_size > 1 and k.size(0) in local_cp_kv_lens:
+                     if kv_reorder_idx is None:
+                         kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
+@@ -2392,6 +2554,11 @@ class DSAttention(MegatronModule):
+                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
+                         )
+                     k = k.index_select(0, kv_reorder_idx)
++                    if kpool_gate_score is not None:
++                        kpool_gate_score = gather_from_sequence_parallel_region(
++                            kpool_gate_score, group=cp_group
++                        )
++                        kpool_gate_score = kpool_gate_score.index_select(0, kv_reorder_idx)
+                 if sequence_parallel_tp and q.size(0) != sq:
+                     if (
+                         q.size(0) != sequence_parallel_tp_full_rows
+@@ -2438,7 +2605,8 @@ class DSAttention(MegatronModule):
              )
  
          fused_output = None
@@ -843,7 +865,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..70174144baa0682c9bb5f6e49daf4b88
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2741,19 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2749,19 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
@@ -854,7 +876,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..70174144baa0682c9bb5f6e49daf4b88
 +                with torch.no_grad():
 +                    _, topk_indices = fused_qk_topk_kpool(
 +                        q, k, weights, self.index_topk, self.indexer.index_kpool,
-+                        self.indexer._kpool_gate_score, self.indexer.index_kpool_compress_ape,
++                        kpool_gate_score, self.indexer.index_kpool_compress_ape,
 +                        mask=float_mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
 +                        key_positions=key_positions, cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
 +                        use_relu=self.config.dsa_indexer_scoring_relu,
