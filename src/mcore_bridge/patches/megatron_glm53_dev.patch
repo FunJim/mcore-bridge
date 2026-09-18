@@ -136,6 +136,19 @@ index 762d4aa8dcda1da05712b942b3683aa1fdcb2626..84d8fac7770b4f081863d187d48aef65
          if grad_not_none and is_not_shared and is_not_tp_duplicate:
              grad_obj = getattr(param, grad_attr)
              data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..58fd41ce559503b38207c7244633b8820fd2af5d 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -470,7 +470,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+ 
+                 # fp32 params.
+                 elif model_param.type() == 'torch.cuda.FloatTensor':
+-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
++                    shard_model_param = model_param.detach().view(-1)[param_range.start : param_range.end]
+                     model_fp32_params_this_group.append(model_param)
+                     shard_fp32_params_this_group.append(shard_model_param)
+                     tensor_parallel.copy_tensor_model_parallel_attributes(
 diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
 index f7d29737497d9bf5e7281ad11d3c03ade9e9b2af..c3c704ff6f5bd5d095c0ee953350e274b1a04f89 100644
 --- a/megatron/core/optimizer/optimizer.py
