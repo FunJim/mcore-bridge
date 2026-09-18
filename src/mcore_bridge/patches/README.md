@@ -14,15 +14,18 @@ Included changes and provenance:
 | Change | Reason and source | Regression |
 |---|---|---|
 | Official bridge GLM patch | Original patch from bridge `9d610ff`; GLM numerics from NVIDIA/Megatron-LM PR #7054 `be805e55`, chunked index scoring from `3fceb0715`, expert norm / FP32 attributes from the original patch. Original NVIDIA source licenses and attribution retained. | Existing `tests/test_glm5_hybrid.py`, `tests/test_hybrid_compat.py`; distributed GLM block preflight |
-| FP32 optimizer shards | Detach native FP32 views so CPU offload receives leaf tensors; storage remains shared. Migrated from `FunJim/Megatron-LM` commit `10cf7cf625df57a497a876707b2e270c017e7de6`. | `verify_glm53_fp32_shards.py`: offload 0/0.5/1, AdamW update, optimizer state restore |
-| TileLang shapes | Support GLM's zero RoPE channels and pad KPool top-k slots without changing selected tokens. Migrated from `5b2a86f499d4e24bfeceb2e8998686215ec6dccf`. | `verify_glm53_dsa.py`: output/gradient comparison, 73728-token fused forward/backward |
-| KPool CP | Gather gate scores and reorder them with indexer keys across context-parallel ranks. Migrated from `cb31d880c796bd0b409826ec8790e5206db56a02`. | `verify_glm53_dsa_cp.py`: CPU CP1/CP8 output/gradient parity, packed sequences, negative controls; 4-node CP8 preflight |
+| FP32 optimizer shards | Detach native FP32 views so CPU offload receives leaf tensors; storage remains shared. Maintained in this repository by commit `eb26203`. | `verify_glm53_fp32_shards.py`: offload 0/0.5/1, AdamW update, optimizer state restore |
+| TileLang shapes | Support GLM's zero RoPE channels and pad KPool top-k slots without changing selected tokens. Maintained in this repository by commit `ed3f9c6`. | `verify_glm53_dsa.py`: output/gradient comparison, 73728-token fused forward/backward |
+| KPool CP | Gather gate scores and reorder them with indexer keys across context-parallel ranks. Maintained in this repository by commit `f5cca49`. | `verify_glm53_dsa_cp.py`: CPU CP1/CP8 output/gradient parity, packed sequences, negative controls; 4-node CP8 preflight |
 
-The runtime result is identical to `FunJim/Megatron-LM` commit `cb31d880`.
-That fork is a historical migration source, not an installation dependency.
+The complete runtime patch is maintained in this repository at `f5cca49`;
+its official GLM portion was introduced at `85f6680`. Installation and
+regressions depend only on this repository and the upstream baselines above.
+Historical source commits cited in published commit messages are preserved in
+the maintainer's `FunJim-Megatron-LM.bundle`; those messages are not rewritten.
 Regressions are in `tests/glm53_patch_regression/`. The original patch's
 Megatron unit-test diff was excluded from this runtime-only bundle; it remains
-available in bridge baseline `9d610ff` and Megatron commit `c97ca74`.
+available in bridge baseline `9d610ff`.
 
 Prepare a **new, unused** environment; install the three selected wheels with
 `pip install --no-deps --no-index` (non-editable). Then run once:
@@ -51,10 +54,12 @@ Installer tests (standard library only):
 python -m unittest discover -s tests -p test_apply_megatron_patch.py -v
 ```
 
-For the CPU CP regression's negative control, reconstruct the original official
-patch in a temporary baseline checkout, then apply the FP32/TileLang fixes but
-not KPool CP; or use the historical `5b2a86f` dsa.py. GPU tests require an
-allocated device and the same CUDA libraries as training. No full model is loaded.
+For the CPU CP regression's negative control, extract
+`src/mcore_bridge/patches/megatron_glm53_dev.patch` from this repository's
+`ed3f9c6` commit and apply it to a temporary upstream Megatron `ee743d3ef228`
+checkout. Use the resulting `megatron/core/transformer/experimental_attention_variant/dsa.py`
+as `--before`; it includes FP32/TileLang fixes but not KPool CP. GPU tests require
+an allocated device and the same CUDA libraries as training. No full model is loaded.
 
 Updates: bridge tracks `modelscope/mcore-bridge:main`; Swift tracks
 `modelscope/ms-swift:main`; Megatron tracks `NVIDIA/Megatron-LM:dev`. Integrate
