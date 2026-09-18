@@ -864,6 +864,34 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..70174144baa0682c9bb5f6e49daf4b88
                  starts_i32, ends_i32 = fused_bounds
                  block_size = int(getattr(self, "fused_indexer_block_size", 8192))
                  fused_topk = dsa_kernels.run_fused_qk_topk(
+diff --git a/megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py b/megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py
+index bedcdb4ca1f7193f8c5c2a940fd974fb74799df0..1dcac5b56b440d6cfbb6445538d28efb9457ac14 100644
+--- a/megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py
++++ b/megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py
+@@ -783,6 +783,11 @@ def fused_sparse_mla_absorbed(
+         return None
+     if query.size(-1) != key.size(-1):
+         return None
++    if query.size(-1) == 512 and v_channels == 512:
++        # GLM-5.3 has no RoPE channels. Zero-padding preserves QK scores and
++        # autograd while satisfying SparseMLA's 512 latent + 64 RoPE layout.
++        query = torch.nn.functional.pad(query, (0, 64))
++        key = torch.nn.functional.pad(key, (0, 64))
+     if query.size(-1) != 576 or v_channels != 512:
+         # Current copied TileLang kernels are specialized for GLM5/DeepSeek V3.2 absorbed dims.
+         return None
+@@ -793,7 +798,10 @@ def fused_sparse_mla_absorbed(
+     if not _is_supported_sparse_mla_head_count(kernel_heads, kv_group=key.size(2)):
+         return None
+     if topk_indices.size(-1) % 64 != 0:
+-        return None
++        # KPool appends tail tokens. Invalid slots preserve the selected keys.
++        topk_indices = torch.nn.functional.pad(
++            topk_indices, (0, -topk_indices.size(-1) % 64), value=-1
++        )
+ 
+     query_bshd = query.permute(1, 0, 2, 3).contiguous()
+     if kernel_heads != query_heads:
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
 index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051caea70dd 100644
 --- a/megatron/core/transformer/hyper_connection.py
