@@ -204,13 +204,17 @@ def test_unpatched_dev_is_rejected_at_glm_boundary(monkeypatch):
 
 
 def test_megatron_patch_is_packaged_and_detectable():
-    """The patch must ship inside the package, and carry the marker `is_applied` looks for."""
-    from mcore_bridge.tools.apply_megatron_patch import MARKER_FILE, MARKER_SYMBOL, PATCH, is_applied
+    """The wheel must carry a full-index runtime patch and validate every target."""
+    from mcore_bridge.tools.apply_megatron_patch import PATCH, patch_files, patch_state
 
     text = PATCH.read_text()
-    assert f'+++ b/{MARKER_FILE}' in text, f'the patch no longer touches {MARKER_FILE}'
-    assert MARKER_SYMBOL in text, 'the patch no longer adds the symbol that is_applied() detects'
-    assert not is_applied(PATCH.parent / 'no-such-root')
+    entries = patch_files()
+    assert 'megatron/core/transformer/transformer_config.py' in entries
+    assert 'kda_two_stage_gates' in text
+    assert len(entries) == text.count('diff --git ')
+    assert all(name.startswith('megatron/core/') for name in entries)
+    with pytest.raises(RuntimeError, match='Missing'):
+        patch_state(PATCH.parent / 'no-such-root', entries)
 
 
 @pytest.mark.parametrize('mode', ['full', 'selective'])
