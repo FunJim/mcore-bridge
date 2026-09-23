@@ -60,6 +60,21 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
                 tp_group=self.tp_group,
             )
 
+    @property
+    def transformer_layer(self):
+        """The MTP inner transformer block, under whichever name the running Megatron registers it.
+
+        Megatron dev renamed the attribute to ``mtp_model_layer`` (and keys checkpoints as
+        ``transformer_layer`` for backward compat), while main still calls the module itself
+        ``transformer_layer``. mcore-bridge's forward below and ``GPTBridge._convert_mtp_layer``
+        reference ``.transformer_layer``, so resolve whichever exists.
+        """
+        return self._modules.get('mtp_model_layer', None) or self._modules.get('transformer_layer', None)
+
+    def _get_inner_layer_kwargs(self, input_ids, position_ids):
+        """Return model-specific rolled inputs consumed by the inner transformer layer."""
+        return {}
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -91,6 +106,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             hidden_states=hidden_states,
             decoder_input=decoder_input,
         )
+        kwargs.update(self._get_inner_layer_kwargs(input_ids, position_ids))
         assert not self.transformer_layer.self_attention.config.apply_rope_fusion
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.position_embedding_type == 'rope' and packed_seq:

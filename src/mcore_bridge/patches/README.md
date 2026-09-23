@@ -1,8 +1,13 @@
 # GLM-5.3 runtime patch
 
 Maintained in `FunJim/mcore-bridge`, branch `feat/glm53-flash-support`, starting
-from ModelScope bridge `9d610ffb9c75220cadc3f31922346fa81ca8b456` (without the
-later workspace MTP changes). Swift remains upstream `ac6651a34bedc0d8786291c558314a49371d811f`.
+from ModelScope bridge `9d610ffb9c75220cadc3f31922346fa81ca8b456`, with upstream
+`main` integrated through `bc58ea9cf9b1dd2314637703973904f359e67c75`.
+The integration retains this fork's complete runtime patch and strict installer;
+its KPool CP implementation already covers upstream PR #200. The supported
+training configuration keeps MTP disabled (`mtp_num_layers=0`); the newly imported
+MTP path requires separate validation before use. Swift remains upstream
+`ac6651a34bedc0d8786291c558314a49371d811f`.
 
 `megatron_glm53_dev.patch` targets NVIDIA/Megatron-LM **dev** commit
 `ee743d3ef228f546287dc3835c2cf56011d5136b`. It contains only runtime files,
