@@ -2,9 +2,12 @@
 
 Maintained in `FunJim/mcore-bridge`, branch `feat/glm53-flash-support`, starting
 from ModelScope bridge `9d610ffb9c75220cadc3f31922346fa81ca8b456`, with upstream
-`main` integrated through `bc58ea9cf9b1dd2314637703973904f359e67c75`.
+`main` integrated through `cef925c3dc073fc1627b9afa2af936d1d0779574`.
 The integration retains this fork's complete runtime patch and strict installer;
-its KPool CP implementation already covers upstream PR #200. The supported
+its KPool CP implementation already covers upstream PR #200. Upstream PR #208
+contains the contributed installer reliability improvements with source-drift /
+three-way-merge support. This pinned-baseline fork retains its strict full-file
+hash installer and matching tests instead of adopting that broader policy. The supported
 training configuration keeps MTP disabled (`mtp_num_layers=0`); the newly imported
 MTP path requires separate validation before use. Swift remains upstream
 `ac6651a34bedc0d8786291c558314a49371d811f`.
@@ -85,3 +88,12 @@ selected updates on a temporary branch, regenerate the full-index patch against
 the new baseline, remove fixes already absorbed upstream, and rerun regressions
 before merging to `feat/glm53-flash-support`. Record the three actual commits.
 Do not rebase published history or force-push.
+
+The 2026-09-23 integration passed 50 GLM single-GPU tests (no skips), 36 optimizer
+reload cases, FP32 shard regressions, a 73728-token TileLang forward/backward,
+and CPU CP1/CP8 output/gradient checks with negative controls. A randomly
+initialized small GLM model also passed three packed length cases on all eight
+H200 ranks (TP1/PP1/CP8/EP1, MTP=0), with finite nonzero DSA/KDA projection
+gradients. This is single-node validation, not full-model or cross-node training.
+The final #208 merge changes this documentation only relative to the tested
+runtime at `b5679967d7c4ff577c453c4c37685d0af48a32f2`.
