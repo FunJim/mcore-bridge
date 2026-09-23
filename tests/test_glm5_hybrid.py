@@ -204,12 +204,13 @@ def test_unpatched_dev_is_rejected_at_glm_boundary(monkeypatch):
 
 
 def test_megatron_patch_is_packaged_and_detectable():
-    """The patch must ship inside the package, and carry the marker `is_applied` looks for."""
-    from mcore_bridge.tools.apply_megatron_patch import MARKER_FILE, MARKER_SYMBOL, PATCH, is_applied
+    """The packaged patch must expose runtime targets without requiring Megatron's test tree."""
+    from mcore_bridge.tools.apply_megatron_patch import PATCH, is_applied, patch_files
 
-    text = PATCH.read_text()
-    assert f'+++ b/{MARKER_FILE}' in text, f'the patch no longer touches {MARKER_FILE}'
-    assert MARKER_SYMBOL in text, 'the patch no longer adds the symbol that is_applied() detects'
+    entries = patch_files(source_checkout=False)
+    assert 'megatron/core/transformer/transformer_config.py' in entries
+    assert 'kda_two_stage_gates' in PATCH.read_text()
+    assert all(name.startswith('megatron/core/') for name in entries)
     assert not is_applied(PATCH.parent / 'no-such-root')
 
 
