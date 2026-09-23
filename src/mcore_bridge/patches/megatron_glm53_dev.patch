@@ -136,11 +136,26 @@ index 762d4aa8dcda1da05712b942b3683aa1fdcb2626..84d8fac7770b4f081863d187d48aef65
          if grad_not_none and is_not_shared and is_not_tp_duplicate:
              grad_obj = getattr(param, grad_attr)
              data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index 45bf910f84dd066c700d83fb919932d2b3732428..cc7600f463bd8288f66e8948501af3e921203dcd 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -382,6 +382,10 @@
+         """
+         for param, fp32_param in self.param_to_fp32_param.items():
+             fp32_param.data.copy_(param)
++        # Native FP32 params and distributed masters have CPU copies but no dtype-conversion entry.
++        for param, cpu_copy in self.gpu_params_map_cpu_copy.items():
++            if param not in self.param_to_fp32_param:
++                cpu_copy.data.copy_(param)
+ 
+     def _register_load_state_dict_hooks(self):
+         def pre_load_state_dict_hook(self, state_dict):
 diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
-index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..58fd41ce559503b38207c7244633b8820fd2af5d 100644
+index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0e455b77b 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -470,7 +470,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+@@ -470,7 +470,7 @@
  
                  # fp32 params.
                  elif model_param.type() == 'torch.cuda.FloatTensor':
@@ -149,6 +164,29 @@ index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..58fd41ce559503b38207c7244633b882
                      model_fp32_params_this_group.append(model_param)
                      shard_fp32_params_this_group.append(shard_model_param)
                      tensor_parallel.copy_tensor_model_parallel_attributes(
+@@ -3167,7 +3167,10 @@
+         self.ensure_master_weights_for_param_sync()
+         self.assert_master_weights_resident("_copy_model_params_to_main_params")
+ 
+-        if isinstance(self.optimizer, HybridDeviceOptimizer):
++        if isinstance(self.optimizer, HybridDeviceOptimizer) and (
++            self.ddp_config.use_megatron_fsdp
++            or self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
++        ):
+             self.optimizer.update_fp32_param_by_new_param()
+             return
+ 
+@@ -3242,6 +3245,10 @@
+         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
+ 
++        if isinstance(self.optimizer, HybridDeviceOptimizer):
++            # Hybrid CPU copies must follow the refreshed distributed FP32 master shards.
++            self.optimizer.update_fp32_param_by_new_param()
++
+     def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
+         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+ 
 diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
 index f7d29737497d9bf5e7281ad11d3c03ade9e9b2af..c3c704ff6f5bd5d095c0ee953350e274b1a04f89 100644
 --- a/megatron/core/optimizer/optimizer.py
