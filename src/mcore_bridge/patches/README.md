@@ -3,11 +3,10 @@
 Maintained in `FunJim/mcore-bridge`, branch `feat/glm53-flash-support`, starting
 from ModelScope bridge `9d610ffb9c75220cadc3f31922346fa81ca8b456`, with upstream
 `main` integrated through `cef925c3dc073fc1627b9afa2af936d1d0779574`.
-The integration retains this fork's complete runtime patch and strict installer;
-its KPool CP implementation already covers upstream PR #200. Upstream PR #208
-contains the contributed installer reliability improvements with source-drift /
-three-way-merge support. This pinned-baseline fork retains its strict full-file
-hash installer and matching tests instead of adopting that broader policy. The supported
+The fork retains its complete runtime patch; its KPool CP implementation already
+covers upstream PR #200. The installer is the upstream PR #208 implementation,
+including source-drift / three-way-merge support and complete patch checks.
+Its tests retain only the adjustment for this runtime-only patch bundle. The supported
 training configuration keeps MTP disabled (`mtp_num_layers=0`); the newly imported
 MTP path requires separate validation before use. Swift remains upstream
 `ac6651a34bedc0d8786291c558314a49371d811f`.
@@ -50,10 +49,11 @@ Alternatively, before building the Megatron wheel, apply to a source checkout:
 python src/mcore_bridge/tools/apply_megatron_patch.py --root /path/to/Megatron-LM
 ```
 
-All affected files must match the base, or all must match the patched result.
-Mixed/unknown content fails before mutation. A dry run precedes application;
-failed application restores original files. An advisory lock serializes tool
-invocations, but does **not** make modifying an active training environment safe.
+The installer checks all selected patch hunks rather than full-file hashes.
+Unrelated source edits are allowed; source checkouts also support Git three-way
+merges. Partial installations and conflicts are rejected before publishing changes.
+Application is prepared in a temporary directory; failed publication restores
+original files. Run a single installer process in an unused environment.
 Do not run this from each training rank, combine with older patch scripts, or
 upgrade an environment in use. `--check` is read-only and suitable for preflight.
 
@@ -95,5 +95,11 @@ and CPU CP1/CP8 output/gradient checks with negative controls. A randomly
 initialized small GLM model also passed three packed length cases on all eight
 H200 ranks (TP1/PP1/CP8/EP1, MTP=0), with finite nonzero DSA/KDA projection
 gradients. This is single-node validation, not full-model or cross-node training.
-The final #208 merge changes this documentation only relative to the tested
+The #208 integration merge changed this documentation only relative to the tested
 runtime at `b5679967d7c4ff577c453c4c37685d0af48a32f2`.
+Adopting the upstream installer leaves the runtime patch unchanged. Validate it
+against the pinned baseline wheel and source with `MEGATRON_PATCH_BASE_WHEEL`
+and `MEGATRON_PATCH_BASE_SOURCE` when running the installer tests above; those
+integration tests compare every patched file with its recorded Git blob hash.
+Reproduce an environment using its three recorded source commits, not installer
+acceptance of a different source version.
