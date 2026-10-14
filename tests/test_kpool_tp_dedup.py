@@ -157,7 +157,7 @@ def sample(case='packed', dtype=None, batch=1, lengths=(7, 13, 21)):
     return kwargs
 
 
-def new_attention(dsa, mode='b1', policy='first', group=None):
+def new_attention(dsa, mode='tp_dedup', policy='first', group=None):
     indexer = types.SimpleNamespace(index_kpool=4, index_kpool_compress_ape=sample()['ape'],
                                     index_kpool_always_select_tail=True)
     config = types.SimpleNamespace(num_layers=1, dsa_indexer_topk=16, dsa_indexer_topk_freq=1,
@@ -165,7 +165,7 @@ def new_attention(dsa, mode='b1', policy='first', group=None):
                                    dsa_indexer_kpool=4, kv_channels=8, dsa_indexer_scoring_relu=True,
                                    indexer=indexer)
     groups = types.SimpleNamespace(tp=group, cp=None)
-    with patch.dict(os.environ, {'MCORE_KPOOL_EXPERIMENT': mode, 'MCORE_KPOOL_VALIDATE': policy}):
+    with patch.dict(os.environ, {'MCORE_KPOOL_SELECTION_MODE': mode, 'MCORE_KPOOL_VALIDATE': policy}):
         return dsa.DSAttention(config, types.SimpleNamespace(indexer=object()), 1, None, 'self',
                                softmax_scale=1.0, pg_collection=groups)
 
@@ -188,9 +188,9 @@ def distributed_worker(rank, rendezvous, sources):
             kwargs = sample(case)
             _, expected = dsa.fused_qk_topk_kpool(**kwargs)
             with patch.object(dsa, '_compute_index_scores', wraps=dsa._compute_index_scores) as scores:
-                actual = adapter.run_selection(**kwargs, mode='b1', tp_group=group, check_replicas=False)
+                actual = adapter.run_selection(**kwargs, mode='tp_dedup', tp_group=group, check_replicas=False)
                 rows = sum(call.args[0].shape[0] for call in scores.call_args_list)
-            assert actual.executed_mode == 'b1' and torch.equal(actual.indices, expected)
+            assert actual.executed_mode == 'tp_dedup' and torch.equal(actual.indices, expected)
             count = torch.tensor(rows, dtype=torch.int64)
             dist.all_reduce(count, group=group)
             assert count.item() == kwargs['q'].shape[0]
@@ -198,7 +198,7 @@ def distributed_worker(rank, rendezvous, sources):
         kwargs = sample()
         attention = new_attention(dsa, group=group)
         with patch.object(adapter, 'verify_tp_replicas', wraps=adapter.verify_tp_replicas) as verify:
-            expected = adapter.select_and_validate(**kwargs, mode='b1', tp_group=group).indices
+            expected = adapter.select_and_validate(**kwargs, mode='tp_dedup', tp_group=group).indices
             verify.reset_mock()
             assert torch.equal(dispatch(dsa, attention, kwargs, group, local=True), expected)
             assert not attention._kpool_validated and verify.call_count == 0
@@ -222,7 +222,7 @@ def distributed_worker(rank, rendezvous, sources):
 
         with patch.object(dsa, 'fused_qk_topk_kpool', side_effect=mismatched_reference):
             try:
-                adapter.select_and_validate(**kwargs, mode='b1', tp_group=group)
+                adapter.select_and_validate(**kwargs, mode='tp_dedup', tp_group=group)
             except RuntimeError as error:
                 assert 'ordered indices differ' in str(error)
             else:
@@ -231,12 +231,12 @@ def distributed_worker(rank, rendezvous, sources):
         if rank == 1:
             changed['q'][0, 0, 0, 0] += 1
         try:
-            adapter.run_selection(**changed, mode='b1', tp_group=group)
+            adapter.run_selection(**changed, mode='tp_dedup', tp_group=group)
         except RuntimeError as error:
             assert 'replicas differ' in str(error)
         else:
             raise AssertionError('Unequal replicas accepted')
-        with patch.dict(os.environ, {'MCORE_KPOOL_EXPERIMENT': 'reference' if rank == 0 else 'b1'}):
+        with patch.dict(os.environ, {'MCORE_KPOOL_SELECTION_MODE': 'reference' if rank == 0 else 'tp_dedup'}):
             try:
                 adapter.initialize_mode(group, loss_coeff=0, pool_size=4, index_share=False)
             except RuntimeError as error:
@@ -244,11 +244,11 @@ def distributed_worker(rank, rendezvous, sources):
             else:
                 raise AssertionError('Mixed modes accepted')
         with patch.object(dist, 'all_gather_object', side_effect=AssertionError('object collective')):
-            with patch.dict(os.environ, {'MCORE_KPOOL_EXPERIMENT': 'reference'}):
+            with patch.dict(os.environ, {'MCORE_KPOOL_SELECTION_MODE': 'reference'}):
                 assert adapter.initialize_mode(group, loss_coeff=0, pool_size=4, index_share=False) == 'reference'
         subgroup = dist.new_group([1, 3], backend='gloo', timeout=timedelta(seconds=45))
         if rank in (1, 3):
-            actual = adapter.select_and_validate(**kwargs, mode='b1', tp_group=subgroup)
+            actual = adapter.select_and_validate(**kwargs, mode='tp_dedup', tp_group=subgroup)
             assert torch.equal(actual.indices, expected)
             assert actual.local_rows == (41 if rank == 1 else 0)
         dist.barrier()
@@ -277,7 +277,7 @@ class KPoolTPDedupTest(unittest.TestCase):
                 with self.subTest(dtype=dtype, case=case):
                     kwargs = sample(case, dtype)
                     _, expected = self.dsa.fused_qk_topk_kpool(**kwargs)
-                    for mode in ('reference', 'b1'):
+                    for mode in ('reference', 'tp_dedup'):
                         actual = self.adapter.select_and_validate(**kwargs, mode=mode)
                         self.assertEqual(actual.executed_mode, 'reference')
                         self.assertTrue(torch.equal(actual.indices, expected))
@@ -336,16 +336,16 @@ class KPoolTPDedupTest(unittest.TestCase):
                 kwargs['varlen_starts'] = kwargs['varlen_ends'] = None
                 kwargs['mask'] = torch.zeros(41, 41)
             _, expected = self.dsa.fused_qk_topk_kpool(**kwargs)
-            actual = self.adapter.select_and_validate(**kwargs, mode='b1', query_is_tp_local=True)
+            actual = self.adapter.select_and_validate(**kwargs, mode='tp_dedup', query_is_tp_local=True)
             self.assertEqual(actual.executed_mode, 'reference')
             self.assertTrue(torch.equal(actual.indices, expected))
 
     def test_mode_contract_and_default_constructor(self):
-        for field, value in (('MCORE_KPOOL_EXPERIMENT', 'bad'), ('MCORE_KPOOL_VALIDATE', 'none')):
+        for field, value in (('MCORE_KPOOL_SELECTION_MODE', 'bad'), ('MCORE_KPOOL_VALIDATE', 'none')):
             with patch.dict(os.environ, {field: value}):
                 with self.assertRaises(ValueError):
                     self.adapter.initialize_mode(None, loss_coeff=0, pool_size=4, index_share=False)
-        with patch.dict(os.environ, {'MCORE_KPOOL_EXPERIMENT': 'b1', 'MCORE_KPOOL_VALIDATE': 'first'}):
+        with patch.dict(os.environ, {'MCORE_KPOOL_SELECTION_MODE': 'tp_dedup', 'MCORE_KPOOL_VALIDATE': 'first'}):
             for loss, pool, sharing in ((1, 4, False), (0, 1, False), (0, 4, True)):
                 with self.assertRaises(ValueError):
                     self.adapter.initialize_mode(None, loss_coeff=loss, pool_size=pool, index_share=sharing)

@@ -533,7 +533,7 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654330e68bb 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce6216c1c3 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -668,23 +668,25 @@ def _compute_index_scores(
@@ -878,7 +878,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654
 -
 +        from .dsa_kpool_kernels import initialize_mode, validation_policy
 +
-+        self._kpool_experiment_mode = initialize_mode(
++        self._kpool_selection_mode = initialize_mode(
 +            getattr(pg_collection, "tp", None),
 +            loss_coeff=self.config.dsa_indexer_loss_coeff or 0.0,
 +            pool_size=getattr(self.config, "dsa_indexer_kpool", 1) or 1,
@@ -887,7 +887,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654
 +        self._kpool_validation_policy = validation_policy()
 +        self._kpool_validated = False
 +        self._kpool_last_selection = None
-+        self._kpool_selection_counts = {"b1": 0, "reference": 0}
++        self._kpool_selection_counts = {"tp_dedup": 0, "reference": 0}
 +
          self.indexer = None
          if not self.skip_topk:
@@ -933,7 +933,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654
 +                # cuDNN's token top-k does not implement pool compression; keep dev's subsequent
 +                # sparse attention path.
 +                with torch.no_grad():
-+                    if self._kpool_experiment_mode == "reference":
++                    if self._kpool_selection_mode == "reference":
 +                        _, topk_indices = fused_qk_topk_kpool(
 +                            q, k, weights, self.index_topk, self.indexer.index_kpool,
 +                            kpool_gate_score, self.indexer.index_kpool_compress_ape,
@@ -949,7 +949,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654
 +                        selection = select_and_validate(
 +                            q, k, weights, self.index_topk, self.indexer.index_kpool,
 +                            kpool_gate_score, self.indexer.index_kpool_compress_ape,
-+                            mode=self._kpool_experiment_mode, tp_group=tp_group,
++                            mode=self._kpool_selection_mode, tp_group=tp_group,
 +                            query_is_tp_local=sequence_parallel_query_is_local,
 +                            mask=float_mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
 +                            key_positions=key_positions,
@@ -959,7 +959,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654
 +                            check_replicas=(self._kpool_validation_policy == "all"
 +                                            or not self._kpool_validated),
 +                        )
-+                        if selection.executed_mode == "b1" and selection.replica_checks:
++                        if selection.executed_mode == "tp_dedup" and selection.replica_checks:
 +                            self._kpool_validated = True
 +                            logger.info("KPool TP dedup validated layer=%s policy=%s metadata=%s",
 +                                        self.layer_number, self._kpool_validation_policy,
@@ -976,14 +976,14 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..f540dc72adf66fd3cd3396de3a0e9654
                  fused_topk = dsa_kernels.run_fused_qk_topk(
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d87a07bb16
+index 0000000000000000000000000000000000000000..72d903874b5b074335cfbc405b5d3cd71589908b
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
 @@ -0,0 +1,271 @@
 +# Copyright (c) ModelScope Contributors. All rights reserved.
 +"""Opt-in TP scoring deduplication for replicated KPool queries.
 +
-+The reference scoring path remains the default. B1 requires batch=1, indexer
++The reference scoring path remains the default. TP dedup requires batch=1, indexer
 +loss disabled, pool_size>1 and no index sharing. TP1 and TP-local queries use
 +reference selection. Configuration is agreed by every TP rank at construction;
 +input descriptors are agreed on each optimized call. ``first`` validates exact
@@ -999,7 +999,7 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +import torch
 +import torch.distributed as dist
 +
-+MODES = ("reference", "b1")
++MODES = ("reference", "tp_dedup")
 +VALIDATION_POLICIES = ("all", "first")
 +
 +
@@ -1017,10 +1017,10 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +        return {k: v for k, v in vars(self).items() if k != "indices"}
 +
 +
-+def experiment_mode():
-+    mode = os.environ.get("MCORE_KPOOL_EXPERIMENT", "reference")
++def selection_mode():
++    mode = os.environ.get("MCORE_KPOOL_SELECTION_MODE", "reference")
 +    if mode not in MODES:
-+        raise ValueError(f"MCORE_KPOOL_EXPERIMENT must be one of {MODES}, got {mode!r}")
++        raise ValueError(f"MCORE_KPOOL_SELECTION_MODE must be one of {MODES}, got {mode!r}")
 +    return mode
 +
 +
@@ -1051,15 +1051,15 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +
 +
 +def initialize_mode(group, *, loss_coeff, pool_size, index_share):
-+    mode = os.environ.get("MCORE_KPOOL_EXPERIMENT", "reference")
++    mode = os.environ.get("MCORE_KPOOL_SELECTION_MODE", "reference")
 +    policy = os.environ.get("MCORE_KPOOL_VALIDATE", "all")
 +    agree_contract(group, (mode, policy, loss_coeff, pool_size, index_share))
 +    if policy not in VALIDATION_POLICIES:
 +        raise ValueError(f"Invalid KPool validation policy {policy!r}")
 +    if mode not in MODES:
-+        raise ValueError(f"Invalid KPool experiment mode {mode!r}")
++        raise ValueError(f"Invalid KPool selection mode {mode!r}")
 +    if mode != "reference" and (loss_coeff or pool_size <= 1 or index_share):
-+        raise ValueError("KPool experiments require loss_coeff=0, pool_size>1, index_share=False")
++        raise ValueError("KPool TP dedup requires loss_coeff=0, pool_size>1, index_share=False")
 +    return mode
 +
 +
@@ -1175,7 +1175,7 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +    from . import dsa_masking
 +    from .dsa import _compute_index_scores
 +    if mode not in MODES:
-+        raise ValueError(f"Unsupported KPool experiment mode {mode!r}")
++        raise ValueError(f"Unsupported KPool selection mode {mode!r}")
 +    kwargs = dict(q=q, k=k, weights=weights, index_topk=index_topk, pool_size=pool_size,
 +                  gate_score=gate_score, ape=ape, mask=mask, varlen_starts=varlen_starts,
 +                  varlen_ends=varlen_ends, key_positions=key_positions,
@@ -1200,9 +1200,9 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +    if varlen_starts is not None and (varlen_starts.shape != (q.shape[0],)
 +                                      or varlen_ends.shape != (q.shape[0],)):
 +        raise ValueError("v1 requires one-dimensional query bounds")
-+    if mode == "b1" and (group_size(tp_group) == 1 or query_is_tp_local):
++    if mode == "tp_dedup" and (group_size(tp_group) == 1 or query_is_tp_local):
 +        return _fallback(mode, "TP1 or already TP-local queries", kwargs)
-+    if check_replicas and mode == "b1":
++    if check_replicas and mode == "tp_dedup":
 +        verify_tp_replicas(tp_group, dict(q=q, k=k, weights=weights, gate=gate_score, ape=ape,
 +                                        starts=varlen_starts, ends=varlen_ends,
 +                                        positions=key_positions, cu=cu_seqlens_kv))
@@ -1230,7 +1230,7 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +    received = [torch.empty_like(send) for _ in ranges]
 +    dist.all_gather(received, send, group=tp_group)
 +    indices = torch.cat([tensor[:b - a] for tensor, (a, b) in zip(received, ranges)], dim=0).unsqueeze(0)
-+    return SelectionResult(indices, mode, "b1", local_rows=hi - lo,
++    return SelectionResult(indices, mode, "tp_dedup", local_rows=hi - lo,
 +                           score_chunk_rows=chunk_rows, replica_checks=check_replicas)
 +
 +
@@ -1238,7 +1238,7 @@ index 0000000000000000000000000000000000000000..2b5b4fc0d44e57dab78c820b369017d8
 +def select_and_validate(*args, **kwargs):
 +    """Use the same failure decision on every TP rank for ordered-index parity."""
 +    result = run_selection(*args, **kwargs)
-+    if result.executed_mode != "b1" or not result.replica_checks:
++    if result.executed_mode != "tp_dedup" or not result.replica_checks:
 +        return result
 +    from .dsa import fused_qk_topk_kpool
 +
