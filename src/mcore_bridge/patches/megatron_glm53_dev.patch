@@ -533,10 +533,10 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce6216c1c3 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e4b8072bc 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
-@@ -668,23 +668,25 @@ def _compute_index_scores(
+@@ -668,23 +668,37 @@ def _compute_index_scores(
      Returns:
          index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
      """
@@ -567,19 +567,31 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
 +    chunk_size = min(sq, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
 +    index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
 +
++    import os
++
++    fusion = os.environ.get('MCORE_KPOOL_RELU_MUL_FUSION', '0')
++    if fusion not in ('0', '1'):
++        raise ValueError('MCORE_KPOOL_RELU_MUL_FUSION must be 0 or 1')
++    fuse_relu_mul = use_relu and fusion == '1'
++    if fuse_relu_mul:
++        from mcore_bridge.kpool_relu_mul import relu_mul
++
 +    for start in range(0, sq, chunk_size):
 +        end = min(start + chunk_size, sq)
 +        # [chunk, batch, heads, sk]
 +        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
-+        if use_relu:
-+            scores.relu_()
-+        # Weight and sum over heads in one step: [chunk, batch, sk]
-+        index_scores[start:end] = (scores * weights[start:end].unsqueeze(-1)).sum(dim=2)
-+        del scores
++        if fuse_relu_mul:
++            weighted = relu_mul(scores, weights[start:end])
++        else:
++            if use_relu:
++                scores.relu_()
++            weighted = scores * weights[start:end].unsqueeze(-1)
++        index_scores[start:end] = weighted.sum(dim=2)
++        del scores, weighted
  
      # Transpose to [batch, seqlen_q, seqlen_k].
      index_scores = index_scores.transpose(0, 1)
-@@ -741,6 +743,116 @@ def fused_qk_topk_naive(
+@@ -741,6 +755,116 @@ def fused_qk_topk_naive(
      return index_scores, topk_indices
  
  
@@ -696,7 +708,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
  def fwd_fused_indexer_loss_naive(
      q,
      weights,
-@@ -975,36 +1087,47 @@ def bwd_fused_indexer_loss_naive(
+@@ -975,36 +1099,47 @@ def bwd_fused_indexer_loss_naive(
      grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
      del grad_index_scores
  
@@ -770,7 +782,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
  
      return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
  
-@@ -1443,7 +1566,10 @@ class DSAIndexer(MegatronModule):
+@@ -1443,7 +1578,10 @@ class DSAIndexer(MegatronModule):
          self.pg_collection = pg_collection
  
          # Initialize Position Embedding.
@@ -782,7 +794,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
              self.rotary_pos_emb = RotaryEmbedding(
                  self.qk_pos_emb_head_dim,
                  rotary_percent=self.config.rotary_percent,
-@@ -1520,6 +1646,21 @@ class DSAIndexer(MegatronModule):
+@@ -1520,6 +1658,21 @@ class DSAIndexer(MegatronModule):
                  skip_weight_param_allocation=False,
                  parallel_mode="duplicated",
              )
@@ -804,7 +816,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
          self._weights_proj_te_gemm_supported: Optional[bool] = None
          # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
          # should be averaged during final gradient synchronization.
-@@ -1557,6 +1698,8 @@ class DSAIndexer(MegatronModule):
+@@ -1557,6 +1710,8 @@ class DSAIndexer(MegatronModule):
          rotary_pos_sin: Optional[torch.Tensor] = None,
      ):
          """Apply RoPE to the input tensor."""
@@ -813,7 +825,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
          if rotary_pos_cos is not None or rotary_pos_sin is not None:
              assert rotary_pos_cos is not None and rotary_pos_sin is not None
              assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
-@@ -1623,14 +1766,17 @@ class DSAIndexer(MegatronModule):
+@@ -1623,14 +1778,17 @@ class DSAIndexer(MegatronModule):
          # =========================================
          # Prepare RoPE params
          # =========================================
@@ -838,7 +850,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
              rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                  rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
              )
-@@ -1716,6 +1862,8 @@ class DSAIndexer(MegatronModule):
+@@ -1716,6 +1874,8 @@ class DSAIndexer(MegatronModule):
          # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
          weights = self._project_indexer_weights(x)
          weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
@@ -847,7 +859,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
  
          return q, k, weights
  
-@@ -1748,9 +1896,20 @@ class DSAIndexer(MegatronModule):
+@@ -1748,9 +1908,20 @@ class DSAIndexer(MegatronModule):
          q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
  
          # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
@@ -871,7 +883,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
  
          return index_scores, topk_indices
  
-@@ -1975,7 +2134,19 @@ class DSAttention(MegatronModule):
+@@ -1975,7 +2146,19 @@ class DSAttention(MegatronModule):
          if pg_collection is None:
              pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
          self.pg_collection = pg_collection
@@ -892,7 +904,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
          self.indexer = None
          if not self.skip_topk:
              self.indexer = build_module(
-@@ -2382,6 +2553,9 @@ class DSAttention(MegatronModule):
+@@ -2382,6 +2565,9 @@ class DSAttention(MegatronModule):
              assert self.indexer is not None
              with torch.enable_grad() if use_indexer_loss else torch.no_grad():
                  q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
@@ -902,7 +914,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
                  if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                      if kv_reorder_idx is None:
                          kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
-@@ -2392,6 +2566,11 @@ class DSAttention(MegatronModule):
+@@ -2392,6 +2578,11 @@ class DSAttention(MegatronModule):
                              f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                          )
                      k = k.index_select(0, kv_reorder_idx)
@@ -914,7 +926,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
                  if sequence_parallel_tp and q.size(0) != sq:
                      if (
                          q.size(0) != sequence_parallel_tp_full_rows
-@@ -2438,7 +2617,8 @@ class DSAttention(MegatronModule):
+@@ -2438,7 +2629,8 @@ class DSAttention(MegatronModule):
              )
  
          fused_output = None
@@ -924,7 +936,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0fe243fba14f60d92b43239ed36bccce
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2761,48 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2773,48 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
