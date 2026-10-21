@@ -103,3 +103,18 @@ and `MEGATRON_PATCH_BASE_SOURCE` when running the installer tests above; those
 integration tests compare every patched file with its recorded Git blob hash.
 Reproduce an environment using its three recorded source commits, not installer
 acceptance of a different source version.
+
+## Opt-in Swift route prebuild + block10 recipe
+
+`swift_glm53_route_prebuild.patch` adds the tested packed CP metadata entry call
+for Swift `07d4ecdaa210ef778d8185be53a7a5b44a843ec8`. Apply it separately with
+`python -m mcore_bridge.tools.apply_swift_patch`, then verify with `--check`.
+It is inactive unless `MCORE_CP_ROUTE_PREBUILD=1` and CP>1. Megatron block10 is an
+existing recomputation setting supplied through training arguments.
+
+See [the combined recipe and validation](../../../docs/glm53_block10_route.md)
+for installation, PR #1 + PR #2 + block10 + route switches, regressions, measured
+throughput/memory tradeoffs and the limits of the combined-environment comparison.
+
+Whitespace rewrite hooks exclude `.patch` files to preserve unified-diff context
+markers and trailing context lines needed for zero-fuzz application.
