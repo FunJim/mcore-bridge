@@ -86,7 +86,7 @@ def load_sources(sources):
     package.dsa_masking = masking
     compile_functions(mask_text, MASK_HELPERS, masking)
     dsa = types.ModuleType(PACKAGE + '.dsa')
-    dsa.torch, dsa.dsa_masking = torch, masking
+    dsa.torch, dsa.dsa_masking, dsa.os = torch, masking, os
     sys.modules[dsa.__name__] = dsa
     package.dsa = dsa
     compile_functions(dsa_text, HELPERS, dsa)

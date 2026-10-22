@@ -140,7 +140,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
 index 45bf910f84dd066c700d83fb919932d2b3732428..cc7600f463bd8288f66e8948501af3e921203dcd 100644
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -382,6 +382,10 @@
+@@ -382,6 +382,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
@@ -155,7 +155,7 @@ diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimi
 index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0e455b77b 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -470,7 +470,7 @@
+@@ -470,7 +470,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
  
                  # fp32 params.
                  elif model_param.type() == 'torch.cuda.FloatTensor':
@@ -164,7 +164,7 @@ index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0
                      model_fp32_params_this_group.append(model_param)
                      shard_fp32_params_this_group.append(shard_model_param)
                      tensor_parallel.copy_tensor_model_parallel_attributes(
-@@ -3167,7 +3167,10 @@
+@@ -3167,7 +3167,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
          self.ensure_master_weights_for_param_sync()
          self.assert_master_weights_resident("_copy_model_params_to_main_params")
  
@@ -176,7 +176,7 @@ index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0
              self.optimizer.update_fp32_param_by_new_param()
              return
  
-@@ -3242,6 +3245,10 @@
+@@ -3242,6 +3245,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
          copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
          copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
  
@@ -476,6 +476,84 @@ index 3318972baec1bfab6a144d9b98d7b9aa1a476910..5c84d69584166751bdd06993b48d13ef
  
  
  def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, is_expert=False):
+diff --git a/megatron/core/tensor_parallel/random.py b/megatron/core/tensor_parallel/random.py
+index 8a76c8e4d6787dc25728ce26169f88ef1b69dec3..a73cc78dfa60164a1587cfcb22b90529778de844 100644
+--- a/megatron/core/tensor_parallel/random.py
++++ b/megatron/core/tensor_parallel/random.py
+@@ -5,7 +5,9 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import functools
+ import logging
++import os
+ from collections.abc import Callable
+ from typing import Any, Optional, TypeVar, Union
+ 
+@@ -658,6 +660,28 @@ _R = TypeVar('_R')
+ _Ts = TypeVarTuple('_Ts')
+ 
+ 
++def _kpool_checkpoint_region(phase):
++    def decorate(function):
++        @functools.wraps(function)
++        def wrapped(ctx, *args, **kwargs):
++            if (os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off') == 'off'
++                    and not hasattr(ctx, '_kpool_replay_owner')):
++                return function(ctx, *args, **kwargs)
++            from mcore_bridge.kpool_checkpoint_replay import checkpoint_region
++
++            previous = is_checkpointing()
++            try:
++                with checkpoint_region(ctx, phase):
++                    return function(ctx, *args, **kwargs)
++            finally:
++                if previous:
++                    _set_checkpointing()
++                else:
++                    _unset_checkpointing()
++        return wrapped
++    return decorate
++
++
+ class CheckpointFunction(torch.autograd.Function):
+     """Checkpoint Function
+ 
+@@ -668,6 +692,7 @@ class CheckpointFunction(torch.autograd.Function):
+ 
+     # pylint: disable=missing-function-docstring
+     @staticmethod
++    @_kpool_checkpoint_region('original')
+     def forward(
+         ctx: Any,
+         run_function: Callable[[Unpack[_Ts]], _R],
+@@ -702,6 +727,7 @@ class CheckpointFunction(torch.autograd.Function):
+ 
+     # pylint: disable=missing-function-docstring
+     @staticmethod
++    @_kpool_checkpoint_region('recompute')
+     def backward(ctx, *args):
+         """Backward pass."""
+         from megatron.core.transformer.cuda_graphs import is_graph_capturing
+@@ -727,6 +753,9 @@ class CheckpointFunction(torch.autograd.Function):
+             detached_inputs = detach_variable(inputs)
+             with torch.enable_grad():
+                 outputs = ctx.run_function(*detached_inputs)
++            if hasattr(ctx, '_kpool_replay_owner'):
++                from mcore_bridge.kpool_checkpoint_replay import finish_recompute
++                finish_recompute()
+ 
+         if isinstance(outputs, torch.Tensor):
+             outputs = (outputs,)
+@@ -753,6 +782,8 @@ def checkpoint(
+     # CheckpointWithoutOutput. The graph captures all ops directly; recomputation cannot
+     # run inside a captured graph.
+     if is_graph_warmup() or is_graph_capturing():
++        if os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off') != 'off':
++            raise RuntimeError('KPool checkpoint replay does not support CUDA graph warmup/capture')
+         return function(*args)
+     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+ 
 diff --git a/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py b/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py
 index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c2f2e30de 100644
 --- a/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py
@@ -533,7 +611,7 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e4b8072bc 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f4f0d7d14 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -668,23 +668,37 @@ def _compute_index_scores(
@@ -883,11 +961,10 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e
  
          return index_scores, topk_indices
  
-@@ -1975,7 +2146,19 @@ class DSAttention(MegatronModule):
+@@ -1975,6 +2146,18 @@ class DSAttention(MegatronModule):
          if pg_collection is None:
              pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
          self.pg_collection = pg_collection
--
 +        from .dsa_kpool_kernels import initialize_mode, validation_policy
 +
 +        self._kpool_selection_mode = initialize_mode(
@@ -900,10 +977,9 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e
 +        self._kpool_validated = False
 +        self._kpool_last_selection = None
 +        self._kpool_selection_counts = {"tp_dedup": 0, "reference": 0}
-+
+ 
          self.indexer = None
          if not self.skip_topk:
-             self.indexer = build_module(
 @@ -2382,6 +2565,9 @@ class DSAttention(MegatronModule):
              assert self.indexer is not None
              with torch.enable_grad() if use_indexer_loss else torch.no_grad():
@@ -936,7 +1012,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2773,48 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2773,55 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
@@ -945,6 +1021,13 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e
 +                # cuDNN's token top-k does not implement pool compression; keep dev's subsequent
 +                # sparse attention path.
 +                with torch.no_grad():
++                    import os
++
++                    if os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off') != 'off':
++                        from mcore_bridge.kpool_checkpoint_replay import eligibility_contract
++                        eligibility_contract(self.indexer, loss_coeff=self.config.dsa_indexer_loss_coeff,
++                                             index_share=self.index_share,
++                                             selection_mode=self._kpool_selection_mode)
 +                    if self._kpool_selection_mode == "reference":
 +                        _, topk_indices = fused_qk_topk_kpool(
 +                            q, k, weights, self.index_topk, self.indexer.index_kpool,
@@ -988,10 +1071,10 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..0985022df1dcc99f48b007db61255d2e
                  fused_topk = dsa_kernels.run_fused_qk_topk(
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..72d903874b5b074335cfbc405b5d3cd71589908b
+index 0000000000000000000000000000000000000000..104adb66ba5e76be9eef4eac6ed6123790ae0b9d
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,322 @@
 +# Copyright (c) ModelScope Contributors. All rights reserved.
 +"""Opt-in TP scoring deduplication for replicated KPool queries.
 +
@@ -1065,7 +1148,15 @@ index 0000000000000000000000000000000000000000..72d903874b5b074335cfbc405b5d3cd7
 +def initialize_mode(group, *, loss_coeff, pool_size, index_share):
 +    mode = os.environ.get("MCORE_KPOOL_SELECTION_MODE", "reference")
 +    policy = os.environ.get("MCORE_KPOOL_VALIDATE", "all")
-+    agree_contract(group, (mode, policy, loss_coeff, pool_size, index_share))
++    replay = os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off')
++    replay_settings = (replay, os.environ.get('MCORE_KPOOL_REPLAY_MAX_BYTES', str(1024 ** 3)),
++                       os.environ.get('MCORE_KPOOL_REPLAY_MAX_ENTRIES', '64'))
++    agree_contract(group, (mode, policy, loss_coeff, pool_size, index_share, replay_settings))
++    if replay != 'off':
++        from mcore_bridge.kpool_checkpoint_replay import validate_configuration
++        validate_configuration()
++        if mode != 'tp_dedup' or loss_coeff or pool_size <= 1 or index_share:
++            raise ValueError('KPool checkpoint replay requires TP dedup, frozen loss-free selection')
 +    if policy not in VALIDATION_POLICIES:
 +        raise ValueError(f"Invalid KPool validation policy {policy!r}")
 +    if mode not in MODES:
@@ -1175,6 +1266,9 @@ index 0000000000000000000000000000000000000000..72d903874b5b074335cfbc405b5d3cd7
 +
 +def _fallback(mode, reason, kwargs):
 +    from .dsa import fused_qk_topk_kpool
++    if os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off') != 'off':
++        from mcore_bridge.kpool_checkpoint_replay import bypass_selection
++        bypass_selection(reason)
 +    _, indices = fused_qk_topk_kpool(**kwargs)
 +    return SelectionResult(indices, mode, "reference", reason)
 +
@@ -1195,10 +1289,20 @@ index 0000000000000000000000000000000000000000..72d903874b5b074335cfbc405b5d3cd7
 +                  always_select_tail=always_select_tail)
 +    if mode == "reference":
 +        return _fallback(mode, "", kwargs)
++    replay = None
++    replay_mode = os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off')
++    replay_contract = ('off', None, 0)
++    if replay_mode != 'off':
++        from mcore_bridge import kpool_checkpoint_replay as replay
++        replay_contract = replay.current_contract()
 +    agree_contract(tp_group, (mode, query_is_tp_local, check_replicas, index_topk, pool_size,
-+                             use_relu, always_select_tail,
++                             use_relu, always_select_tail, replay_mode, replay_contract,
++                             replay is not None and replay.failure_pending(),
++                             cu_seqlens_kv.tolist() if replay is not None and cu_seqlens_kv is not None else None,
 +                             tuple((name, _descriptor(value)) for name, value in kwargs.items()
 +                                   if isinstance(value, torch.Tensor) or value is None)))
++    if replay is not None and replay.failure_pending():
++        raise replay.ReplayError('KPool replay eligibility failed on all TP ranks')
 +    if pool_size <= 1 or index_topk <= 0 or index_topk % pool_size:
 +        raise ValueError("KPool requires positive token budget divisible by pool size")
 +    if q.ndim != 4 or k.ndim != 3 or weights.shape != q.shape[:-1]:
@@ -1225,22 +1329,52 @@ index 0000000000000000000000000000000000000000..72d903874b5b074335cfbc405b5d3cd7
 +                                     varlen_ends, key_positions, cu_seqlens_kv)
 +    chunk_rows = min(q.shape[0], max(1, 1024 ** 3 // max(1, q.shape[1] * q.shape[2] * bases.numel() * 4)))
 +    ranges = shard_ranges(q.shape[0], chunk_rows, group_size(tp_group))
++    if replay is not None:
++        saved_ranges, saved_chunk_rows = replay.communication_layout((tuple(ranges), chunk_rows))
++        if tuple(ranges) != tuple(saved_ranges) or chunk_rows != saved_chunk_rows:
++            replay.mark_failure('KPool derived communication layout changed on recompute')
++            ranges, chunk_rows = list(saved_ranges), saved_chunk_rows
 +    rank = dist.get_rank(tp_group)
 +    lo, hi = ranges[rank]
 +    width = index_topk + (pool_size - 1 if always_select_tail else 0)
-+    if hi > lo:
++    def compute_local():
++        if hi <= lo:
++            return torch.empty((1, 0, width), dtype=torch.int32, device=q.device)
 +        scores = _compute_index_scores(q[lo:hi], weights[lo:hi], pooled, use_relu=use_relu)
 +        scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts[lo:hi], ends[lo:hi], positions)
-+        local = _select(scores, bases, starts[lo:hi], ends[lo:hi], index_topk, pool_size,
-+                        always_select_tail)
-+        del scores
-+    else:
-+        local = torch.empty((1, 0, width), dtype=torch.int32, device=q.device)
++        return _select(scores, bases, starts[lo:hi], ends[lo:hi], index_topk, pool_size,
++                       always_select_tail)
++
++    failure = None
++    try:
++        if replay is None:
++            local = compute_local()
++        else:
++            local = replay.local_selection(
++                compute_local,
++                contract=(mode, id(tp_group), rank, tuple(ranges), chunk_rows, index_topk,
++                          pool_size, use_relu, always_select_tail,
++                          os.environ.get('MCORE_KPOOL_RELU_MUL_FUSION', '0')),
++                inputs={name: value for name, value in kwargs.items()
++                        if isinstance(value, torch.Tensor) or value is None},
++                bounds=(starts[lo:hi], ends[lo:hi], positions, bases),
++            )
++    except Exception as error:
++        if replay is None or not isinstance(error, replay.ReplayError):
++            raise
++        failure = str(error)
++        replay.mark_failure(error)
++        local = torch.full((1, hi - lo, width), -2, dtype=torch.int32, device=q.device)
 +    max_rows = max(b - a for a, b in ranges)
 +    send = torch.full((max_rows, width), -1, dtype=torch.int32, device=q.device)
 +    send[:hi - lo].copy_(local[0])
++    if failure is not None and hi == lo:
++        send[0, 0] = -2
 +    received = [torch.empty_like(send) for _ in ranges]
 +    dist.all_gather(received, send, group=tp_group)
++    if replay is not None and any(tensor[0, 0].item() == -2 for tensor in received):
++        replay.mark_failure(failure or 'KPool replay contract failed on another TP rank')
++        raise replay.ReplayError(failure or 'KPool replay contract failed on another TP rank')
 +    indices = torch.cat([tensor[:b - a] for tensor, (a, b) in zip(received, ranges)], dim=0).unsqueeze(0)
 +    return SelectionResult(indices, mode, "tp_dedup", local_rows=hi - lo,
 +                           score_chunk_rows=chunk_rows, replica_checks=check_replicas)
