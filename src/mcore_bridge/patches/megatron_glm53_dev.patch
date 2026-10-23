@@ -614,7 +614,7 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/m
 index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f4f0d7d14 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
-@@ -668,23 +668,37 @@ def _compute_index_scores(
+@@ -668,23 +668,38 @@ def _compute_index_scores(
      Returns:
          index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
      """
@@ -647,29 +647,30 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
 +
 +    import os
 +
-+    fusion = os.environ.get('MCORE_KPOOL_RELU_MUL_FUSION', '0')
-+    if fusion not in ('0', '1'):
-+        raise ValueError('MCORE_KPOOL_RELU_MUL_FUSION must be 0 or 1')
-+    fuse_relu_mul = use_relu and fusion == '1'
-+    if fuse_relu_mul:
-+        from mcore_bridge.kpool_relu_mul import relu_mul
++    head_sum = os.environ.get('MCORE_KPOOL_HEAD_SUM_FUSION', '0')
++    if head_sum not in ('0', '1'):
++        raise ValueError('MCORE_KPOOL_HEAD_SUM_FUSION must be 0 or 1')
++    fuse_head_sum = use_relu and head_sum == '1'
++    if fuse_head_sum:
++        from mcore_bridge.kpool_relu_mul import relu_mul_sum
 +
 +    for start in range(0, sq, chunk_size):
 +        end = min(start + chunk_size, sq)
 +        # [chunk, batch, heads, sk]
 +        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
-+        if fuse_relu_mul:
-+            weighted = relu_mul(scores, weights[start:end])
-+        else:
-+            if use_relu:
-+                scores.relu_()
-+            weighted = scores * weights[start:end].unsqueeze(-1)
++        if fuse_head_sum:
++            relu_mul_sum(scores, weights[start:end], out=index_scores[start:end])
++            del scores
++            continue
++        if use_relu:
++            scores.relu_()
++        weighted = scores * weights[start:end].unsqueeze(-1)
 +        index_scores[start:end] = weighted.sum(dim=2)
 +        del scores, weighted
  
      # Transpose to [batch, seqlen_q, seqlen_k].
      index_scores = index_scores.transpose(0, 1)
-@@ -741,6 +755,116 @@ def fused_qk_topk_naive(
+@@ -741,6 +756,116 @@ def fused_qk_topk_naive(
      return index_scores, topk_indices
  
  
@@ -786,7 +787,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
  def fwd_fused_indexer_loss_naive(
      q,
      weights,
-@@ -975,36 +1099,47 @@ def bwd_fused_indexer_loss_naive(
+@@ -975,36 +1100,47 @@ def bwd_fused_indexer_loss_naive(
      grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
      del grad_index_scores
  
@@ -860,7 +861,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
  
      return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
  
-@@ -1443,7 +1578,10 @@ class DSAIndexer(MegatronModule):
+@@ -1443,7 +1579,10 @@ class DSAIndexer(MegatronModule):
          self.pg_collection = pg_collection
  
          # Initialize Position Embedding.
@@ -872,7 +873,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
              self.rotary_pos_emb = RotaryEmbedding(
                  self.qk_pos_emb_head_dim,
                  rotary_percent=self.config.rotary_percent,
-@@ -1520,6 +1658,21 @@ class DSAIndexer(MegatronModule):
+@@ -1520,6 +1659,21 @@ class DSAIndexer(MegatronModule):
                  skip_weight_param_allocation=False,
                  parallel_mode="duplicated",
              )
@@ -894,7 +895,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
          self._weights_proj_te_gemm_supported: Optional[bool] = None
          # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
          # should be averaged during final gradient synchronization.
-@@ -1557,6 +1710,8 @@ class DSAIndexer(MegatronModule):
+@@ -1557,6 +1711,8 @@ class DSAIndexer(MegatronModule):
          rotary_pos_sin: Optional[torch.Tensor] = None,
      ):
          """Apply RoPE to the input tensor."""
@@ -903,7 +904,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
          if rotary_pos_cos is not None or rotary_pos_sin is not None:
              assert rotary_pos_cos is not None and rotary_pos_sin is not None
              assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
-@@ -1623,14 +1778,17 @@ class DSAIndexer(MegatronModule):
+@@ -1623,14 +1779,17 @@ class DSAIndexer(MegatronModule):
          # =========================================
          # Prepare RoPE params
          # =========================================
@@ -928,7 +929,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
              rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                  rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
              )
-@@ -1716,6 +1874,8 @@ class DSAIndexer(MegatronModule):
+@@ -1716,6 +1875,8 @@ class DSAIndexer(MegatronModule):
          # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
          weights = self._project_indexer_weights(x)
          weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
@@ -937,7 +938,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
  
          return q, k, weights
  
-@@ -1748,9 +1908,20 @@ class DSAIndexer(MegatronModule):
+@@ -1748,9 +1909,20 @@ class DSAIndexer(MegatronModule):
          q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
  
          # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
@@ -961,7 +962,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
  
          return index_scores, topk_indices
  
-@@ -1975,6 +2146,18 @@ class DSAttention(MegatronModule):
+@@ -1975,6 +2147,18 @@ class DSAttention(MegatronModule):
          if pg_collection is None:
              pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
          self.pg_collection = pg_collection
@@ -980,7 +981,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
  
          self.indexer = None
          if not self.skip_topk:
-@@ -2382,6 +2565,9 @@ class DSAttention(MegatronModule):
+@@ -2382,6 +2566,9 @@ class DSAttention(MegatronModule):
              assert self.indexer is not None
              with torch.enable_grad() if use_indexer_loss else torch.no_grad():
                  q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
@@ -990,7 +991,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
                  if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                      if kv_reorder_idx is None:
                          kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
-@@ -2392,6 +2578,11 @@ class DSAttention(MegatronModule):
+@@ -2392,6 +2579,11 @@ class DSAttention(MegatronModule):
                              f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                          )
                      k = k.index_select(0, kv_reorder_idx)
@@ -1002,7 +1003,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
                  if sequence_parallel_tp and q.size(0) != sq:
                      if (
                          q.size(0) != sequence_parallel_tp_full_rows
-@@ -2438,7 +2629,8 @@ class DSAttention(MegatronModule):
+@@ -2438,7 +2630,8 @@ class DSAttention(MegatronModule):
              )
  
          fused_output = None
@@ -1012,7 +1013,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2773,55 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2774,55 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
@@ -1071,10 +1072,10 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f
                  fused_topk = dsa_kernels.run_fused_qk_topk(
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..104adb66ba5e76be9eef4eac6ed6123790ae0b9d
+index 0000000000000000000000000000000000000000..f1c7583322fff5b99e782c07c00dda2888671fe9
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,325 @@
 +# Copyright (c) ModelScope Contributors. All rights reserved.
 +"""Opt-in TP scoring deduplication for replicated KPool queries.
 +
@@ -1151,7 +1152,10 @@ index 0000000000000000000000000000000000000000..104adb66ba5e76be9eef4eac6ed61237
 +    replay = os.environ.get('MCORE_KPOOL_CHECKPOINT_REPLAY', 'off')
 +    replay_settings = (replay, os.environ.get('MCORE_KPOOL_REPLAY_MAX_BYTES', str(1024 ** 3)),
 +                       os.environ.get('MCORE_KPOOL_REPLAY_MAX_ENTRIES', '64'))
-+    agree_contract(group, (mode, policy, loss_coeff, pool_size, index_share, replay_settings))
++    scoring = os.environ.get('MCORE_KPOOL_HEAD_SUM_FUSION', '0')
++    agree_contract(group, (mode, policy, loss_coeff, pool_size, index_share, replay_settings, scoring))
++    if scoring not in ('0', '1'):
++        raise ValueError('MCORE_KPOOL_HEAD_SUM_FUSION must be 0 or 1')
 +    if replay != 'off':
 +        from mcore_bridge.kpool_checkpoint_replay import validate_configuration
 +        validate_configuration()
@@ -1354,7 +1358,7 @@ index 0000000000000000000000000000000000000000..104adb66ba5e76be9eef4eac6ed61237
 +                compute_local,
 +                contract=(mode, id(tp_group), rank, tuple(ranges), chunk_rows, index_topk,
 +                          pool_size, use_relu, always_select_tail,
-+                          os.environ.get('MCORE_KPOOL_RELU_MUL_FUSION', '0')),
++                          os.environ.get('MCORE_KPOOL_HEAD_SUM_FUSION', '0')),
 +                inputs={name: value for name, value in kwargs.items()
 +                        if isinstance(value, torch.Tensor) or value is None},
 +                bounds=(starts[lo:hi], ends[lo:hi], positions, bases),
@@ -1492,7 +1496,7 @@ index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051
              from megatron.core.fusions.fused_mhc_kernels import (
                  fused_h_aggregate,
                  fused_h_aggregate_into,
-@@ -296,9 +319,9 @@ class HyperConnectionModule(MegatronModule):
+@@ -296,13 +319,24 @@ class HyperConnectionModule(MegatronModule):
              self._proj_rms_compute_h_op = fused_proj_rms_compute_h
          else:
              self._sinkhorn_op = native_sinkhorn
@@ -1502,9 +1506,25 @@ index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051
 -            self._h_post_bda_op = native_h_post_bda
 +            self._h_post_bda_op = native_h_post_bda_fp32 if config.mhc_keep_mappings_in_fp32 else native_h_post_bda
              self._proj_rms_compute_h_op = None
++
++        import os
++        post_fusion = os.environ.get('MCORE_MHC_POST_BDA_FP32_FUSION', '0')
++        if post_fusion not in ('0', '1'):
++            raise ValueError('MCORE_MHC_POST_BDA_FP32_FUSION must be 0 or 1')
++        if post_fusion == '1':
++            if (config.use_fused_mhc or not config.mhc_keep_mappings_in_fp32
++                    or config.num_residual_streams != 4 or config.hidden_size != 4096):
++                raise ValueError('FP32 post-BDA fusion requires unfused FP32 mHC with 4 streams and hidden=4096')
++            from mcore_bridge.mhc_post_bda import post_bda
++            self._h_post_bda_op = post_bda
  
          self._init_weights()
-@@ -417,7 +440,7 @@ class HyperConnectionModule(MegatronModule):
+-
++
+     def _init_weights(self) -> None:
+         """Initialize weights for stable training."""
+         nn.init.xavier_uniform_(self.mapping_proj.weight)
+@@ -417,7 +451,7 @@ class HyperConnectionModule(MegatronModule):
          # The mixing weights are bounded (sigmoid outputs / doubly stochastic
          # matrix), so after the FP32 computation they are safe to apply to the
          # streams in the activation dtype.
@@ -1513,7 +1533,7 @@ index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051
          return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
  
      # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@@ -541,7 +564,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -541,7 +575,7 @@ class HyperConnectionModule(MegatronModule):
          # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
          h_res_batched = h_res.view(s * b, n, n)
          # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
@@ -1522,7 +1542,7 @@ index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051
  
          # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
          mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
-@@ -818,7 +841,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -818,7 +852,7 @@ class HyperConnectionModule(MegatronModule):
          bda_func = get_bias_dropout_add(training, fused)
          with torch.cuda.nvtx.range("HyperConnection::bda"):
              output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
@@ -1531,7 +1551,7 @@ index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051
  
      @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
      def _fused_h_res_h_post_bda_with_checkpoint(
-@@ -893,7 +916,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -893,7 +927,7 @@ class HyperConnectionModule(MegatronModule):
                          bias_expanded = None
                  with torch.cuda.nvtx.range("HyperConnection::bda"):
                      output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
