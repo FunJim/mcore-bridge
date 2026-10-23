@@ -14,7 +14,7 @@ try:
 except ImportError:
     McoreDSAttention = object
 
-mcore_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
+mcore_ge_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
 
 
 class DSAttention(McoreDSAttention):
@@ -47,4 +47,5 @@ register_model(ModelMeta(
     ModelType.glm_moe_dsa,
     ['glm_moe_dsa'],
     loader=GlmMoeDsaLoader,
+    mtp_prefix='model.layers',
 ))
