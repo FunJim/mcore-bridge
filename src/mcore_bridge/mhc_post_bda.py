@@ -33,7 +33,7 @@ def _kernels():
         import triton.language as tl
 
         @triton.jit
-        def mcore_mhc_post_bda_fwd(HR, R, HP, X, BIAS, O, ROWS: tl.constexpr,
+        def mcore_mhc_post_bda_fwd(HR, R, HP, X, BIAS, O,
                                    HAS_BIAS: tl.constexpr, BLOCK: tl.constexpr):
             row = tl.program_id(0)
             c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -56,7 +56,7 @@ def _kernels():
                 tl.store(O + row * 16384 + i * 4096 + c, post + mixed)
 
         @triton.jit
-        def mcore_mhc_post_bda_bwd_inputs(HR, HP, G, DR, DX, ROWS: tl.constexpr, BLOCK: tl.constexpr):
+        def mcore_mhc_post_bda_bwd_inputs(HR, HP, G, DR, DX, BLOCK: tl.constexpr):
             row = tl.program_id(0)
             c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
             g0 = tl.load(G + row * 16384 + c).to(tl.float32)
@@ -76,7 +76,7 @@ def _kernels():
                 tl.store(DR + row * 16384 + j * 4096 + c, dr)
 
         @triton.jit
-        def mcore_mhc_post_bda_bwd_mappings(R, X, BIAS, G, DHR, DHP, ROWS: tl.constexpr,
+        def mcore_mhc_post_bda_bwd_mappings(R, X, BIAS, G, DHR, DHP,
                                             HAS_BIAS: tl.constexpr, BLOCK: tl.constexpr):
             row = tl.program_id(0)
             i = tl.program_id(1)
@@ -111,7 +111,7 @@ class _PostBDA(torch.autograd.Function):
                 with torch.cuda.device(residual.device):
                     _kernels()[0][(rows, 16)](
                         h_res, residual, h_post, x, bias if bias is not None else x, out,
-                        ROWS=rows, HAS_BIAS=bias is not None, BLOCK=256, num_warps=4, enable_fp_fusion=False)
+                        HAS_BIAS=bias is not None, BLOCK=256, num_warps=4, enable_fp_fusion=False)
             return out
 
     @staticmethod
@@ -132,11 +132,11 @@ class _PostBDA(torch.autograd.Function):
                 with torch.cuda.device(residual.device):
                     _, inputs, mappings = _kernels()
                     with nvtx_range('mhc/post_bda_bwd_inputs'):
-                        inputs[(rows, 16)](h_res, h_post, g, dr, dx_fp32, ROWS=rows, BLOCK=256,
+                        inputs[(rows, 16)](h_res, h_post, g, dr, dx_fp32, BLOCK=256,
                                            num_warps=4, enable_fp_fusion=False)
                     with nvtx_range('mhc/post_bda_bwd_mappings'):
                         mappings[(rows, 4)](residual, x, bias if bias is not None else x, g, dhr, dhp,
-                                            ROWS=rows, HAS_BIAS=ctx.has_bias, BLOCK=4096,
+                                            HAS_BIAS=ctx.has_bias, BLOCK=4096,
                                             num_warps=8, enable_fp_fusion=False)
             with nvtx_range('mhc/post_bda_bwd_postprocess'):
                 dbias = dx_fp32.reshape(rows, 4096).sum(0).to(bias.dtype) if ctx.has_bias else None

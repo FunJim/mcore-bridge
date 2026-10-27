@@ -1,7 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib.util
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest import mock
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -91,6 +93,23 @@ class PostBDACudaTest(unittest.TestCase):
                         updated_fused = fused.detach().float() - 8e-6 * fused.grad.float()
                         updated_base = base.detach().float() - 8e-6 * base.grad.float()
                         torch.testing.assert_close(updated_fused, updated_base, rtol=1e-5, atol=1e-6)
+
+    def test_dynamic_shapes_reuse_kernel_variants(self):
+        for bias_dtype in (None, torch.bfloat16, torch.float32):
+            with self.subTest(bias_dtype=bias_dtype):
+                module = load_module()
+                kernels = module._kernels()
+                for kernel in kernels:
+                    self.assertNotIn('ROWS', kernel.arg_names)
+                with ExitStack() as stack:
+                    compiles = [stack.enter_context(mock.patch.object(
+                        kernel, '_do_compile', wraps=kernel._do_compile)) for kernel in kernels]
+                    for seq, batch in ((3, 1), (5, 1), (3, 2), (5, 1)):
+                        values = inputs('cuda', seq=seq, batch=batch, bias_dtype=bias_dtype)
+                        output = module.post_bda(*values)
+                        output.backward(torch.randn_like(output))
+                        self.assertEqual([compile.call_count for compile in compiles], [1, 1, 1])
+                        self.assertTrue(all(v.grad is not None for v in values if v is not None))
 
     def test_checkpoint_and_autocast(self):
         first = inputs('cuda')
