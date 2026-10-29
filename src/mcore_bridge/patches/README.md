@@ -14,7 +14,7 @@ MTP path requires separate validation before use. Swift remains upstream
 `megatron_glm53_dev.patch` targets NVIDIA/Megatron-LM **dev** commit
 `ee743d3ef228f546287dc3835c2cf56011d5136b`. It contains only runtime files,
 so it also applies to the installed `megatron-core` wheel. Full Git blob hashes
-record the supported before/after content of all 14 affected files.
+record the supported before/after content of all 15 affected files.
 
 Included changes and provenance:
 
@@ -25,6 +25,7 @@ Included changes and provenance:
 | Weights-only optimizer reload | Refresh distributed FP32 masters from loaded model shards before refreshing HybridDeviceOptimizer CPU copies. CPU copies of native FP32 parameters must also be refreshed. Otherwise the first update can overwrite loaded weights with stale or nonfinite values. Reproduced during GLM weights-only continuation with CPU offload. | `verify_glm53_optimizer_reload.py`: real shard builder, partial ranges, FP32/BF16, offload 0/0.5/1, overlap on/off, checkpoint-state input, stale/NaN controls, zero-gradient preservation and AdamW update parity |
 | TileLang shapes | Support GLM's zero RoPE channels and pad KPool top-k slots without changing selected tokens. Maintained in this repository by commit `ed3f9c6`. | `verify_glm53_dsa.py`: output/gradient comparison, 73728-token fused forward/backward |
 | KPool CP | Gather gate scores and reorder them with indexer keys across context-parallel ranks. Maintained in this repository by commit `f5cca49`. | `verify_glm53_dsa_cp.py`: CPU CP1/CP8 output/gradient parity, packed sequences, negative controls; 4-node CP8 preflight |
+| Detailed NVTX | Opt-in DSA scoring, pooling, masking, top-k and THD TP gather/scatter markers; shape labels only read tensor metadata. Controlled by Megatron's existing `configure_nvtx_profiling`, with no numerical or collective changes. | `verify_glm53_nvtx.py`: instrumentation-stripped AST parity, CPU scoring output/gradient parity and KPool output parity, balanced NVTX with a mocked CUDA sink |
 
 The complete runtime patch is maintained on `feat/glm53-flash-support`;
 its official GLM portion was introduced at `85f6680`. Installation and
@@ -103,3 +104,26 @@ and `MEGATRON_PATCH_BASE_SOURCE` when running the installer tests above; those
 integration tests compare every patched file with its recorded Git blob hash.
 Reproduce an environment using its three recorded source commits, not installer
 acceptance of a different source version.
+
+### Detailed profiling validation
+
+Enable `configure_nvtx_profiling(True)` before trainer construction on selected
+profiling ranks. Do not toggle it inside an already active Megatron NVTX range:
+push/pop consult the same global switch. CUDA profiler start/stop still controls
+the capture window. These forward-call scopes are CPU submission ranges; they do
+not automatically label the later autograd backward of a collective.
+
+Compare the previous bridge-patched runtime with the new runtime, using source
+directories containing the same `megatron/core/` layout:
+
+```bash
+python tests/glm53_patch_regression/verify_glm53_nvtx.py \
+  --before /path/to/previous-runtime --after /path/to/new-runtime \
+  --report /path/to/nvtx-parity.json
+```
+
+`--ast-only` runs without Torch. CPU parity uses the real scoring/KPool functions
+and actual Megatron NVTX helpers with a mocked CUDA sink. Real GPU capture,
+multi-chunk long inputs, and NCCL backward attribution still require a separate
+allocated-GPU validation. The earlier GPU test results above do not validate
+this new instrumentation.

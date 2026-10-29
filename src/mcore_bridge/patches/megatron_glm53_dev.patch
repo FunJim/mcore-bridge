@@ -1,3 +1,48 @@
+diff --git a/megatron/core/context_parallel_layout/conversion.py b/megatron/core/context_parallel_layout/conversion.py
+index 2763f2a8f0674d2157484622fe49b3ee5273e557..3e16efd41bf6502b652c73a1dee38af76f272205 100644
+--- a/megatron/core/context_parallel_layout/conversion.py
++++ b/megatron/core/context_parallel_layout/conversion.py
+@@ -278,9 +278,13 @@ def convert_cp_partition_mode(
+         # This gather is only used to run a duplicated CP layout permutation before
+         # scattering back to SP shards. Its backward must split, not reduce-scatter;
+         # otherwise every TP rank contributes the same full-sequence gradient.
+-        gathered = gather_from_sequence_parallel_region(
+-            input_=moved, tensor_parallel_output_grad=False, group=tp_group
+-        )
++        with nvtx_range(
++            f"cp_layout/thd/tp_gather/{source_layout}_to_{target_layout}"
++            f"/shape={tuple(moved.shape)}"
++        ):
++            gathered = gather_from_sequence_parallel_region(
++                input_=moved, tensor_parallel_output_grad=False, group=tp_group
++            )
+         converted = _redistribute_thd_layout(
+             x=gathered,
+             cp_group=cp_group,
+@@ -290,7 +294,8 @@ def convert_cp_partition_mode(
+             target_partition_mode=target_layout,
+             thd_cp_partition_route=thd_cp_partition_route,
+         )
+-        scattered = scatter_to_sequence_parallel_region(input_=converted, group=tp_group)
++        with nvtx_range(f"cp_layout/thd/tp_scatter/{source_layout}_to_{target_layout}"):
++            scattered = scatter_to_sequence_parallel_region(input_=converted, group=tp_group)
+         return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
+ 
+     return _redistribute_thd_layout(
+@@ -351,9 +356,10 @@ def _redistribute_thd_layout(
+ 
+         route = thd_cp_partition_route
+         if route is None:
+-            route = build_thd_cp_partition_route(
+-                cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank, device=x.device
+-            )
++            with nvtx_range(f"cp_layout/thd/build_route/{conversion_name}"):
++                route = build_thd_cp_partition_route(
++                    cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank, device=x.device
++                )
+ 
+         if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
+             send_index = route.zigzag_index
 diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
 index 088c09c4502fb6272a5cd9a5a51a6cad54842cca..54b0e63ea8ee806158a5fd3299c498f3078cde2c 100644
 --- a/megatron/core/models/hybrid/hybrid_block.py
@@ -533,10 +578,27 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756df77c9e80 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..1dfea354c5b7452b66ec097c5a922bcdf8ff2ac4 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
-@@ -668,23 +668,25 @@ def _compute_index_scores(
+@@ -33,7 +33,7 @@ from megatron.core.transformer.experimental_attention_variant import (
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+ from megatron.core.transformer.transformer_config import TransformerConfig
+-from megatron.core.utils import ensure_params_ready, get_pg_size
++from megatron.core.utils import ensure_params_ready, get_pg_size, nvtx_decorator, nvtx_range
+ 
+ logger = logging.getLogger(__name__)
+ _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+@@ -646,6 +646,7 @@ def _normalize_indexer_teacher_target(
+     return target / target.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+ 
+ 
++@nvtx_decorator(message="dsa/index_scores")
+ def _compute_index_scores(
+     q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor, use_relu: bool = True
+ ) -> torch.Tensor:
+@@ -668,23 +669,32 @@ def _compute_index_scores(
      Returns:
          index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
      """
@@ -548,43 +610,49 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
 -    # Optionally apply ReLU activation (used by DeepSeek V3.2, not GLM5).
 -    if use_relu:
 -        index_scores = torch.relu(index_scores)
--
++    sq, batch, n_heads, head_dim = q.shape
++    sk = k.size(0)
++    k_fp32 = k.float()
+ 
 -    # Weight each head by attention weights.
 -    # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
 -    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
 -    index_scores = index_scores * weights.unsqueeze(-1)
--
--    # Sum across attention heads.
--    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
--    index_scores = index_scores.sum(dim=2)
-+    sq, batch, n_heads, head_dim = q.shape
-+    sk = k.size(0)
-+    k_fp32 = k.float()
-+
 +    # Chunk over seqlen_q to avoid materializing the full [sq, batch, heads, sk]
 +    # fp32 tensor.  Target ~1 GB per chunk.
 +    bytes_per_token = batch * n_heads * sk * 4
 +    chunk_size = min(sq, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
 +    index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
-+
-+    for start in range(0, sq, chunk_size):
-+        end = min(start + chunk_size, sq)
-+        # [chunk, batch, heads, sk]
-+        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
-+        if use_relu:
-+            scores.relu_()
-+        # Weight and sum over heads in one step: [chunk, batch, sk]
-+        index_scores[start:end] = (scores * weights[start:end].unsqueeze(-1)).sum(dim=2)
-+        del scores
+ 
+-    # Sum across attention heads.
+-    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
+-    index_scores = index_scores.sum(dim=2)
++    with nvtx_range(
++        f"dsa/index_scores/shape/sq={sq}/sk={sk}/batch={batch}"
++        f"/heads={n_heads}/dim={head_dim}/chunk={chunk_size}"
++    ):
++        for start in range(0, sq, chunk_size):
++            end = min(start + chunk_size, sq)
++            # [chunk, batch, heads, sk]
++            with nvtx_range("dsa/index_scores/qk"):
++                scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
++            with nvtx_range("dsa/index_scores/relu"):
++                if use_relu:
++                    scores.relu_()
++            # Weight and sum over heads in one step: [chunk, batch, sk]
++            with nvtx_range("dsa/index_scores/weight_reduce"):
++                index_scores[start:end] = (scores * weights[start:end].unsqueeze(-1)).sum(dim=2)
++            del scores
  
      # Transpose to [batch, seqlen_q, seqlen_k].
      index_scores = index_scores.transpose(0, 1)
-@@ -741,6 +743,116 @@ def fused_qk_topk_naive(
+@@ -741,6 +751,127 @@ def fused_qk_topk_naive(
      return index_scores, topk_indices
  
  
 +# KPool/NoPE from Megatron-LM #7054 / be805e55138888da4eddd0f00ca1114d04b98b9c.
 +# Under this file's NVIDIA license; this port keeps BF16/FP32 only, without the FP8 rollout branch.
++@nvtx_decorator(message="dsa/kpool/compress_keys")
 +def _kpool_compress_keys(k, gate_score, ape, pool_size):
 +    """Compress complete pools only; accumulate in FP32, then cast back to the input dtype so that a
 +    true FP32 reference is possible."""
@@ -598,6 +666,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
 +    return pooled.to(k.dtype)
 +
 +
++@nvtx_decorator(message="dsa/kpool/expand_tokens")
 +def _expand_pools_to_tokens(pool_ids, pool_valid, topk_tokens, pool_size, pool_token_base=None):
 +    """Expand pool indices into fixed-width token indices, keeping -1 for invalid positions."""
 +    assert pool_ids.shape[1] * pool_size == topk_tokens
@@ -613,6 +682,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
 +    ).to(torch.int32)
 +
 +
++@nvtx_decorator(message="dsa/kpool/append_tail")
 +def _append_tail_to_topk(topk_result, seq_lens, pool_size, tail_start_override=None):
 +    """Append each query's incomplete causal tail pool rather than the final pool of the whole sample."""
 +    count = seq_lens.to(torch.int32).remainder(pool_size)
@@ -623,6 +693,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
 +    return torch.cat((topk_result, tail), dim=-1)
 +
 +
++@nvtx_decorator(message="dsa/kpool")
 +def fused_qk_topk_kpool(
 +    q, k, weights, index_topk, pool_size, gate_score, ape, mask=None,
 +    varlen_starts=None, varlen_ends=None, key_positions=None, cu_seqlens_kv=None,
@@ -631,46 +702,53 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
 +    """Select complete causal pools within each document; return global token indices and pool scores."""
 +    if index_topk % pool_size:
 +        raise ValueError("KPool index_topk must be divisible by pool_size")
-+    if cu_seqlens_kv is None:
-+        pooled = _kpool_compress_keys(k, gate_score, ape, pool_size)
-+        bases = torch.arange(pooled.shape[0], device=k.device) * pool_size
-+    else:
-+        parts, base_parts = [], []
-+        for start, end in zip(cu_seqlens_kv[:-1].tolist(), cu_seqlens_kv[1:].tolist()):
-+            part = _kpool_compress_keys(k[start:end], gate_score[start:end], ape, pool_size)
-+            parts.append(part)
-+            base_parts.append(torch.arange(part.shape[0], device=k.device) * pool_size + start)
-+        pooled = torch.cat(parts)
-+        bases = torch.cat(base_parts)
-+    scores = _compute_index_scores(q, weights, pooled, use_relu=use_relu)
-+    pool_ends = bases + pool_size - 1
-+    positions = key_positions[pool_ends] if key_positions is not None else pool_ends
-+    starts, ends, normalized_positions = dsa_masking.normalize_varlen_bounds(
-+        mask=mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
-+        key_positions=positions, sk=pooled.shape[0], device=q.device,
-+    )
-+    if normalized_positions is not None:
-+        positions = normalized_positions
-+    if starts is not None:
-+        scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts, ends, positions)
-+    elif mask is not None:
-+        scores = scores + mask[..., pool_ends]
-+    else:
-+        ends = torch.arange(1, q.shape[0] + 1, device=q.device)
-+        starts = torch.zeros_like(ends)
-+        if cu_seqlens_kv is not None:
-+            cu = cu_seqlens_kv.to(device=q.device, dtype=torch.int64)
-+            starts = cu[torch.searchsorted(cu[1:], ends - 1, right=True)]
-+        scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts, ends, positions)
++    with nvtx_range(
++        f"dsa/kpool/pool/q={tuple(q.shape)}/k={tuple(k.shape)}"
++        f"/pool={pool_size}/topk={index_topk}"
++    ):
++        if cu_seqlens_kv is None:
++            pooled = _kpool_compress_keys(k, gate_score, ape, pool_size)
++            bases = torch.arange(pooled.shape[0], device=k.device) * pool_size
++        else:
++            parts, base_parts = [], []
++            for start, end in zip(cu_seqlens_kv[:-1].tolist(), cu_seqlens_kv[1:].tolist()):
++                part = _kpool_compress_keys(k[start:end], gate_score[start:end], ape, pool_size)
++                parts.append(part)
++                base_parts.append(torch.arange(part.shape[0], device=k.device) * pool_size + start)
++            pooled = torch.cat(parts)
++            bases = torch.cat(base_parts)
++    with nvtx_range("dsa/kpool/scoring"):
++        scores = _compute_index_scores(q, weights, pooled, use_relu=use_relu)
++    with nvtx_range("dsa/kpool/mask"):
++        pool_ends = bases + pool_size - 1
++        positions = key_positions[pool_ends] if key_positions is not None else pool_ends
++        starts, ends, normalized_positions = dsa_masking.normalize_varlen_bounds(
++            mask=mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
++            key_positions=positions, sk=pooled.shape[0], device=q.device,
++        )
++        if normalized_positions is not None:
++            positions = normalized_positions
++        if starts is not None:
++            scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts, ends, positions)
++        elif mask is not None:
++            scores = scores + mask[..., pool_ends]
++        else:
++            ends = torch.arange(1, q.shape[0] + 1, device=q.device)
++            starts = torch.zeros_like(ends)
++            if cu_seqlens_kv is not None:
++                cu = cu_seqlens_kv.to(device=q.device, dtype=torch.int64)
++                starts = cu[torch.searchsorted(cu[1:], ends - 1, right=True)]
++            scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts, ends, positions)
 +    budget = index_topk // pool_size
 +    select = min(budget, pooled.shape[0])
-+    if select:
-+        values, ids = scores.topk(select, dim=-1)
-+        ids = ids.masked_fill(values == float('-inf'), -1)
-+    else:
-+        ids = torch.empty(scores.shape[:-1] + (0,), dtype=torch.long, device=q.device)
-+    if select < budget:
-+        ids = torch.nn.functional.pad(ids, (0, budget - select), value=-1)
++    with nvtx_range("dsa/kpool/topk"):
++        if select:
++            values, ids = scores.topk(select, dim=-1)
++            ids = ids.masked_fill(values == float('-inf'), -1)
++        else:
++            ids = torch.empty(scores.shape[:-1] + (0,), dtype=torch.long, device=q.device)
++        if select < budget:
++            ids = torch.nn.functional.pad(ids, (0, budget - select), value=-1)
 +    batch, queries = ids.shape[:2]
 +    rows = batch * queries
 +    flat_ids = ids.reshape(rows, budget)
@@ -696,7 +774,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
  def fwd_fused_indexer_loss_naive(
      q,
      weights,
-@@ -975,36 +1087,47 @@ def bwd_fused_indexer_loss_naive(
+@@ -975,36 +1106,47 @@ def bwd_fused_indexer_loss_naive(
      grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
      del grad_index_scores
  
@@ -770,7 +848,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
  
      return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
  
-@@ -1443,7 +1566,10 @@ class DSAIndexer(MegatronModule):
+@@ -1443,7 +1585,10 @@ class DSAIndexer(MegatronModule):
          self.pg_collection = pg_collection
  
          # Initialize Position Embedding.
@@ -782,7 +860,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
              self.rotary_pos_emb = RotaryEmbedding(
                  self.qk_pos_emb_head_dim,
                  rotary_percent=self.config.rotary_percent,
-@@ -1520,6 +1646,21 @@ class DSAIndexer(MegatronModule):
+@@ -1520,6 +1665,21 @@ class DSAIndexer(MegatronModule):
                  skip_weight_param_allocation=False,
                  parallel_mode="duplicated",
              )
@@ -804,7 +882,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
          self._weights_proj_te_gemm_supported: Optional[bool] = None
          # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
          # should be averaged during final gradient synchronization.
-@@ -1557,6 +1698,8 @@ class DSAIndexer(MegatronModule):
+@@ -1557,6 +1717,8 @@ class DSAIndexer(MegatronModule):
          rotary_pos_sin: Optional[torch.Tensor] = None,
      ):
          """Apply RoPE to the input tensor."""
@@ -813,7 +891,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
          if rotary_pos_cos is not None or rotary_pos_sin is not None:
              assert rotary_pos_cos is not None and rotary_pos_sin is not None
              assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
-@@ -1623,14 +1766,17 @@ class DSAIndexer(MegatronModule):
+@@ -1623,14 +1785,17 @@ class DSAIndexer(MegatronModule):
          # =========================================
          # Prepare RoPE params
          # =========================================
@@ -838,7 +916,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
              rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                  rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
              )
-@@ -1716,6 +1862,8 @@ class DSAIndexer(MegatronModule):
+@@ -1716,6 +1881,8 @@ class DSAIndexer(MegatronModule):
          # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
          weights = self._project_indexer_weights(x)
          weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
@@ -847,7 +925,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
  
          return q, k, weights
  
-@@ -1748,9 +1896,20 @@ class DSAIndexer(MegatronModule):
+@@ -1748,9 +1915,20 @@ class DSAIndexer(MegatronModule):
          q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
  
          # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
@@ -871,7 +949,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
  
          return index_scores, topk_indices
  
-@@ -2382,6 +2541,9 @@ class DSAttention(MegatronModule):
+@@ -2382,6 +2560,9 @@ class DSAttention(MegatronModule):
              assert self.indexer is not None
              with torch.enable_grad() if use_indexer_loss else torch.no_grad():
                  q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
@@ -881,7 +959,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
                  if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                      if kv_reorder_idx is None:
                          kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
-@@ -2392,6 +2554,11 @@ class DSAttention(MegatronModule):
+@@ -2392,6 +2573,11 @@ class DSAttention(MegatronModule):
                              f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                          )
                      k = k.index_select(0, kv_reorder_idx)
@@ -893,7 +971,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
                  if sequence_parallel_tp and q.size(0) != sq:
                      if (
                          q.size(0) != sequence_parallel_tp_full_rows
-@@ -2438,7 +2605,8 @@ class DSAttention(MegatronModule):
+@@ -2438,7 +2624,8 @@ class DSAttention(MegatronModule):
              )
  
          fused_output = None
@@ -903,7 +981,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3572ea93f7acc56aa71a8fc9218a756d
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2749,19 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2768,19 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
