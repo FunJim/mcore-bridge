@@ -187,6 +187,33 @@ index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0
      def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
          """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
  
+diff --git a/megatron/core/optimizer/layer_wise_optimizer.py b/megatron/core/optimizer/layer_wise_optimizer.py
+index 97628ddfef0d82e4de89fad81fea63d953e59287..3f79f6702f68ea74596244018dc7a210d4bd9dfe 100644
+--- a/megatron/core/optimizer/layer_wise_optimizer.py
++++ b/megatron/core/optimizer/layer_wise_optimizer.py
+@@ -548,6 +548,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
+                         if hasattr(p, 'clear_high_precision_init_val'):
+                             p.clear_high_precision_init_val()
+ 
++        self.tp_group = self.pg_collection.tp
++        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
++        for optimizer in optimizers:
++            # Child optimizers perform TP duplicate filtering when collecting gradients.
++            optimizer.tp_group = self.tp_group
++            optimizer.expert_tp_group = self.expert_tp_group
++
+         super().__init__(optimizers)
+ 
+         self._managed_optimizer_state_offload_indices = tuple(
+@@ -1028,6 +1035,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
+             params,
+             grad_stats_parallel_group=None,
+             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
++            tp_group=self.tp_group,
++            expert_tp_group=self.expert_tp_group,
+         )
+ 
+     def _managed_optimizer_state_offload_child_indices(self) -> tuple[int, ...]:
 diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
 index f7d29737497d9bf5e7281ad11d3c03ade9e9b2af..c3c704ff6f5bd5d095c0ee953350e274b1a04f89 100644
 --- a/megatron/core/optimizer/optimizer.py
@@ -611,7 +638,7 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..3d76bd4a6ed9b515147214c87eccb26f4f0d7d14 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c8c194007 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -668,23 +668,38 @@ def _compute_index_scores(
@@ -1430,7 +1457,7 @@ index bedcdb4ca1f7193f8c5c2a940fd974fb74799df0..1dcac5b56b440d6cfbb6445538d28efb
      query_bshd = query.permute(1, 0, 2, 3).contiguous()
      if kernel_heads != query_heads:
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
-index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..a1725a08b11529c4a579a295b787e051caea70dd 100644
+index 9b23915627a8eb2e14aebeb52ab6a08b49dcf083..11eca59a115bfb83c2b5e8a2a762dce59edd61c3 100644
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
 @@ -1,6 +1,7 @@

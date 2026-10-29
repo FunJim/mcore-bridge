@@ -5,10 +5,11 @@
     python -m mcore_bridge.tools.apply_megatron_patch
 
 The patch (`patches/megatron_glm53_dev.patch`, generated against dev ee743d3ef) backports the
-unmerged Megatron-LM #7054 GLM numerics -- KDA two-stage gates, mHC precision, KPool DSA -- plus two
+unmerged Megatron-LM #7054 GLM numerics -- KDA two-stage gates, mHC precision, KPool DSA -- plus
 Megatron fixes that are not model specific (expert shards deduplicated over the expert TP group when
-the gradient norm is computed, and `allreduce` preserved on fp32 master parameters). Both parts go
-away once they land upstream.
+the gradient norm is computed, `allreduce` preserved on fp32 master parameters, and #6099's TP-group
+propagation to LayerWise child optimizers and zero counting). Drop each backport when its fix is
+present in the supported baseline.
 
 #7054 is tracked by content, not by branch: the numerics come from its `be805e55`, and the chunked
 index-score computation from its current head `3fceb0715`. The chunking matters at real scale --
