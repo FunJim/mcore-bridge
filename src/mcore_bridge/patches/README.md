@@ -14,7 +14,7 @@ MTP path requires separate validation before use. Swift remains upstream
 `megatron_glm53_dev.patch` targets NVIDIA/Megatron-LM **dev** commit
 `ee743d3ef228f546287dc3835c2cf56011d5136b`. It contains only runtime files,
 so it also applies to the installed `megatron-core` wheel. Full Git blob hashes
-record the supported before/after content of all 14 affected files.
+record the supported before/after content of all 17 affected files.
 
 Included changes and provenance:
 
@@ -23,6 +23,7 @@ Included changes and provenance:
 | Official bridge GLM patch | Original patch from bridge `9d610ff`; GLM numerics from NVIDIA/Megatron-LM PR #7054 `be805e55`, chunked index scoring from `3fceb0715`, expert norm / FP32 attributes from the original patch. Original NVIDIA source licenses and attribution retained. | Existing `tests/test_glm5_hybrid.py`, `tests/test_hybrid_compat.py`; distributed GLM block preflight |
 | FP32 optimizer shards | Detach native FP32 views so CPU offload receives leaf tensors; storage remains shared. Maintained in this repository by commit `eb26203`. | `verify_glm53_fp32_shards.py`: offload 0/0.5/1, AdamW update, optimizer state restore |
 | Weights-only optimizer reload | Refresh distributed FP32 masters from loaded model shards before refreshing HybridDeviceOptimizer CPU copies. CPU copies of native FP32 parameters must also be refreshed. Otherwise the first update can overwrite loaded weights with stale or nonfinite values. Reproduced during GLM weights-only continuation with CPU offload. | `verify_glm53_optimizer_reload.py`: real shard builder, partial ranges, FP32/BF16, offload 0/0.5/1, overlap on/off, checkpoint-state input, stale/NaN controls, zero-gradient preservation and AdamW update parity |
+| LayerWise optimizer gradient statistics | Backport NVIDIA/Megatron-LM PR #6099 (`a650054ff593cecfc48708a4e3f1be80573728b7`): propagate TP and expert TP groups to the wrapped child optimizers and zero counting. Uses the bundle's existing expert TP duplicate filtering; fixes expert bias undercounting when TP and ETP differ. | `test_glm53_layer_wise_optimizer.py`: actual patched constructor, gradient norm and zero counting on CPU across TP/ETP topologies, FP32/BF16 wrapping, decoupled gradients, and missing-group negative controls |
 | TileLang shapes | Support GLM's zero RoPE channels and pad KPool top-k slots without changing selected tokens. Maintained in this repository by commit `ed3f9c6`. | `verify_glm53_dsa.py`: output/gradient comparison, 73728-token fused forward/backward |
 | KPool CP | Gather gate scores and reorder them with indexer keys across context-parallel ranks. Maintained in this repository by commit `f5cca49`. | `verify_glm53_dsa_cp.py`: CPU CP1/CP8 output/gradient parity, packed sequences, negative controls; 4-node CP8 preflight |
 
@@ -43,6 +44,11 @@ python -m mcore_bridge.tools.apply_megatron_patch
 python -m mcore_bridge.tools.apply_megatron_patch --check
 ```
 
+When an environment setup script pins `MCORE_BRIDGE_REF`, select a full bridge
+commit containing the #6099 backport before building these wheels. A wheel built
+from an older bridge commit still contains the older patch, even if this checkout
+has been updated. The supported Megatron baseline remains `ee743d3ef228`.
+
 Alternatively, before building the Megatron wheel, apply to a source checkout:
 
 ```bash
@@ -61,6 +67,16 @@ Installer tests (standard library only):
 
 ```bash
 python -m unittest discover -s tests -p test_apply_megatron_patch.py -v
+```
+
+The LayerWise regression needs PyTorch and the pinned Megatron source checkout
+or wheel. It applies the bundled patch in a temporary directory and executes the
+production constructor and gradient-statistics functions with CPU tensors and
+simulated process-group ranks; it does not validate GPU collectives or Muon updates:
+
+```bash
+MEGATRON_PATCH_BASE_SOURCE=/path/to/Megatron-LM \
+  python -m unittest discover -s tests -p test_glm53_layer_wise_optimizer.py -v
 ```
 
 On an allocated GPU, test the installed patch without loading any external plugin:
