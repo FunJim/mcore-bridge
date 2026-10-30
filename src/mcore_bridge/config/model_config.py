@@ -274,6 +274,8 @@ class ModelConfig(TransformerConfig):
     engram_pad_token_id: Optional[int] = None
     engram_compressed_vocab_size: Optional[int] = None
     engram_tokenizer_map: Optional[str] = None
+    ddp_cpu_staging: bool = False
+    csa_query_chunk_size: int = 0
 
     # DeepSeek-V4.1 DSpark. This is intentionally separate from mtp_num_layers:
     # DSpark drafts a block in parallel and adds Markov/confidence heads, whereas

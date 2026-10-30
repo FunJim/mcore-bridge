@@ -56,11 +56,12 @@ from tqdm import tqdm
 from types import SimpleNamespace
 from typing import List, Optional, Sequence, Union
 
+from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
-from mcore_bridge.utils import is_master
+from mcore_bridge.utils import Fp8Dequantizer, is_master
 
 from ..constant import ModelType
 from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
@@ -1332,6 +1333,18 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     additional_dim0_keys = DeepseekV4Bridge.additional_dim0_keys | {'embed', 'head'}
     additional_dim1_keys = DeepseekV4Bridge.additional_dim1_keys | {'main_proj'}
 
+    def _set_param(self, param: torch.Tensor, tensor: torch.Tensor, scale_inv: Optional[torch.Tensor]):
+        quantization = getattr(self.config.hf_config, 'quantization_config', {})
+        if (scale_inv is not None and tensor.dtype == torch.float8_e4m3fn
+                and quantization.get('weight_block_size') == [32, 32]):
+            if self._is_fp8_param(param):
+                raise ValueError('DeepSeek V4.1 source dequantization requires BF16 training parameters')
+            tensor = tensor.reshape(*param.shape)
+            scales = scale_inv.reshape(-1, scale_inv.shape[-1])
+            param.data.copy_(Fp8Dequantizer((32, 32)).convert(tensor, scales))
+            return
+        return super()._set_param(param, tensor, scale_inv)
+
     @staticmethod
     def _lm(mg_model):
         """Resolve the language model. A bare HybridModel is text-only (no ``language_model``
@@ -1369,6 +1382,8 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             self._lm(mg_model), 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
+        if self.config.language_model_only:
+            return GPTBridge._convert_pre_process(self, mg_model, hf_state_dict, hf_prefix, to_mcore)
         # Runs the vision/aligner + image_* block unconditionally instead of branching on *this*
         # rank's ``mg_model.visual``. On export every pipeline stage runs ``_convert`` ->
         # ``_convert_pre_process``, and this path issues the *same* pp-group collective sequence on
@@ -1591,6 +1606,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     def _dequantize_engram_rows(weight, scale):
         if scale is None:
             return weight
+        if (weight.ndim == scale.ndim == 2 and weight.shape[0] == 32 * scale.shape[0]
+                and weight.shape[1] == 32 * scale.shape[1]):
+            return Fp8Dequantizer((32, 32)).convert(weight, scale)
         if weight.ndim != 2 or scale.ndim != 2 or weight.shape[0] != scale.shape[0]:
             raise ValueError(f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
         if weight.shape[1] % scale.shape[1] != 0:
