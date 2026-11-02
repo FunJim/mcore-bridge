@@ -84,6 +84,11 @@ def _apply_mla_rope(t, freqs, *, config, cu_seqlens, cp_group, inverse=False):
     # cp_size > 1, assumes Megatron's zigzag split. DSv4 uses a contiguous split and already
     # stores the absolute position in row i of `freqs`, so the elementwise bshd path is the
     # one that matches this tensor. The argument stays so existing callers keep working.
+    # Packed KV is [tokens, dim], while pre-indexed frequencies keep batch/head axes.
+    # Remove only extra singleton axes so broadcasting cannot introduce token dimensions.
+    while freqs.ndim > t.ndim:
+        assert freqs.shape[-2] == 1, 'DSv4 MLA RoPE has a non-singleton extra frequency axis'
+        freqs = freqs.squeeze(-2)
     return apply_rotary_pos_emb(
         t,
         freqs,

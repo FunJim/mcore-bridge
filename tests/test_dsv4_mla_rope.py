@@ -33,7 +33,8 @@ def test_packed_cu_seqlens_are_not_forwarded():
     assert captured['kwargs']['cu_seqlens'] is None
     assert captured['kwargs']['mla_rotary_interleaved'] is True
     assert captured['t'] is tokens
-    assert captured['freqs'] is freqs
+    assert captured['freqs'].shape == (4, 1, 4)
+    assert captured['freqs'].data_ptr() == freqs.data_ptr()
 
 
 def test_misaligned_frequencies_still_fail():
