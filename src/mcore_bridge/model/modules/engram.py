@@ -1,11 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
+import copy
 import dataclasses
 import torch
 from torch import Tensor
 
+from ...utils import gc_collect, get_logger, use_ngram_embedding_cpu_offload
 from ...utils.megatron_utils import split_cp_inputs
+from .engram_fp8 import Fp8EngramEmbedding, fp8_quant_declared
+
+# Per-row scale block of the released V4.1 tables (32x32 quantize_config, row-scaled table).
+DEEPSEEK_V41_ENGRAM_BLOCK_SIZE = 32
+
+logger = get_logger()
 
 try:
     from megatron.core import mpu
@@ -238,16 +246,54 @@ def _build_ngram_hashes(
 class DeepseekV41Engram(Engram):
     """DeepSeek V4.1 Engram without projection bias or the Qwen short-conv branch."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
         if EngramConfig is None:
             raise RuntimeError('The installed Megatron-Core does not provide Engram.')
-        super().__init__(*args, **kwargs)
+        cpu_offload = use_ngram_embedding_cpu_offload()
+        init_config = copy.copy(config) if cpu_offload else config
+        if cpu_offload:
+            init_config.use_cpu_initialization = True
+        super().__init__(init_config, *args, **kwargs)
+        if cpu_offload:
+            from .engram_cpu import retain_tables_on_cpu
+            retain_tables_on_cpu(self.embedding)
+            get_logger().warning_once('DeepSeek-V4.1 Engram embedding tables are frozen on CPU; '
+                                      'only requested rows are transferred to the accelerator.')
+            self.config = self.embedding.config = config
+            for table in self.embedding.tables:
+                table.config = config
+            if not config.use_cpu_initialization:
+                self.to(device=torch.cuda.current_device())
         # PR #7231's DeepSeek variant predates the released V4.1 checkpoint layout.
         # Keep its initialized weights but remove parameters absent from that checkpoint.
         self.value_projection.register_parameter('bias', None)
         self.key_projection.register_parameter('bias', None)
         self.conv_norm = None
         self.short_conv = None
+        self._maybe_use_fp8_tables()
+
+    def _maybe_use_fp8_tables(self) -> None:
+        """Swap the bf16 row shards for the fp8-resident store when the checkpoint declares them."""
+        if use_ngram_embedding_cpu_offload():
+            return
+        if Fp8EngramEmbedding is None or isinstance(self.embedding, Fp8EngramEmbedding):
+            return
+        if not fp8_quant_declared(getattr(self, 'config', None)):
+            return
+        source = self.embedding
+        first = source.tables[0]
+        spec = dict(
+            table_sizes=source.table_sizes,
+            embedding_dim=source.embedding_dim,
+            ep_group=source.ep_group,
+            tp_group=first.tp_group,
+            expt_dp_group=first.expt_dp_group)
+        # Free the bf16 shards first; holding both peaks at 3x the checkpoint bytes.
+        self.embedding = None
+        del source, first
+        gc_collect()
+        self.embedding = Fp8EngramEmbedding(config=self.config, block_size=DEEPSEEK_V41_ENGRAM_BLOCK_SIZE, **spec)
+        logger.info('DeepSeek-V4.1 Engram tables are fp8-resident and not trained.')
 
     def _mask_excluded_tokens(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
         live = torch.ones_like(input_ids, dtype=torch.bool)

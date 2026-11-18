@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mcore_bridge.bridge import GPTBridge
+from mcore_bridge.model.gpts.deepseek_v4 import DeepseekV4Bridge
 from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Bridge
 
 
@@ -39,7 +39,7 @@ class SourceLoadingTest(unittest.TestCase):
     def test_language_only_preprocessing_skips_vision_markers(self):
         bridge = DeepseekV41Bridge.__new__(DeepseekV41Bridge)
         bridge.config = SimpleNamespace(language_model_only=True)
-        with patch.object(GPTBridge, '_convert_pre_process', return_value={'embedding': 1}) as native:
+        with patch.object(DeepseekV4Bridge, '_convert_pre_process', return_value={'embedding': 1}) as native:
             result = bridge._convert_pre_process(object(), {}, '', True)
         self.assertEqual(result, {'embedding': 1})
         native.assert_called_once()
