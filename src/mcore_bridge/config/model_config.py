@@ -274,6 +274,7 @@ class ModelConfig(TransformerConfig):
     engram_pad_token_id: Optional[int] = None
     engram_compressed_vocab_size: Optional[int] = None
     engram_tokenizer_map: Optional[str] = None
+    engram_fp8_storage: bool = True
     ddp_cpu_staging: bool = False
     csa_query_chunk_size: int = 0
 

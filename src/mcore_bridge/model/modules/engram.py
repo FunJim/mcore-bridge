@@ -274,6 +274,8 @@ class DeepseekV41Engram(Engram):
 
     def _maybe_use_fp8_tables(self) -> None:
         """Swap the bf16 row shards for the fp8-resident store when the checkpoint declares them."""
+        if not getattr(self.config, 'engram_fp8_storage', True):
+            return
         if use_ngram_embedding_cpu_offload():
             return
         if Fp8EngramEmbedding is None or isinstance(self.embedding, Fp8EngramEmbedding):

@@ -219,6 +219,81 @@ def test_swap_keeps_upstream_trainability_on_the_bf16_path():
     assert all(table.weight.requires_grad for table in holder.embedding.tables)
 
 
+def test_fp8_storage_override_keeps_trainable_bf16_tables(monkeypatch):
+    from dataclasses import fields
+
+    from mcore_bridge.config import MLAModelConfig
+
+    field = next(field for field in fields(MLAModelConfig) if field.name == 'engram_fp8_storage')
+    assert field.default is True
+    monkeypatch.setenv('NGRAM_EMBEDDING_CPU_OFFLOAD', '0')
+    monkeypatch.setenv('PLE_CPU_OFFLOAD', '1')
+    config = _config(fp8_declared=True)
+    config.engram_fp8_storage = False
+    config.enable_hyper_connections = False
+    config.hidden_size = 4
+    config.layernorm_epsilon = 1e-6
+    config.init_method = lambda value: value
+    config.context_parallel_size = 1
+    engram_config = SimpleNamespace(
+        tokenizer_remap=None,
+        multipliers=lambda layer: (1, 3),
+        table_sizes=lambda layer: SIZES,
+        head_dim=32,
+        total_memory_dim=64,
+        kernel_size=1,
+        max_ngram_order=2,
+        num_hash_heads=2,
+        hash_boundary_token_id=0,
+        excluded_token_ids=(),
+        variant_spec=SimpleNamespace(
+            projection_bias=False, zero_centered_gamma=False, resets_windows_at_boundary_token=False))
+    module = DeepseekV41Engram(
+        config,
+        engram_config=engram_config,
+        layer_number=1,
+        pg_collection=SimpleNamespace(tp=None, ep=None, expt_dp=None))
+    assert type(module.embedding) is upstream_embedding.EPShardedMultiTableEmbedding
+    assert all(table.weight.dtype == torch.bfloat16 and table.weight.requires_grad for table in module.embedding.tables)
+    raw = (torch.arange(sum(SIZES) * 32).reshape(sum(SIZES), 32) % 8).float() - 4
+    source = raw.to(torch.float8_e4m3fn)
+    state = {
+        'engram.embed.weight': _Tensor(source),
+        'engram.embed.weight_scale_inv': _Tensor(torch.ones(sum(SIZES), 1))
+    }
+    bridge = _export_bridge()
+    bridge.config.engram_num_embeddings = [sum(SIZES)]
+    bridge.config.engram_layer_ids = [0]
+    bridge._load_engram_embedding(module, state)
+    before = [table.weight.detach().clone() for table in module.embedding.tables]
+    for parameter in (module.key_projection.weight, module.value_projection.weight):
+        parameter.data.fill_(0.125)
+    hidden = torch.ones(4, 1, 4, dtype=torch.bfloat16)
+    module(hidden, torch.tensor([[1, 2, 3, 4]])).float().square().mean().backward()
+    masters = [torch.nn.Parameter(table.weight.detach().float()) for table in module.embedding.tables]
+    optimizer = torch.optim.AdamW(masters, lr=0.1, weight_decay=0, foreach=False, fused=False)
+    for table, master in zip(module.embedding.tables, masters):
+        assert table.weight.grad is not None and torch.isfinite(table.weight.grad).all()
+        assert table.weight.grad.count_nonzero() > 0
+        master.grad = table.weight.grad.float()
+    optimizer.step()
+    for table, master, original in zip(module.embedding.tables, masters, before):
+        table.weight.data.copy_(master.detach().to(torch.bfloat16))
+        assert not torch.equal(table.weight, original)
+        adam = optimizer.state[master]
+        assert adam['exp_avg'].dtype == adam['exp_avg_sq'].dtype == torch.float32
+        assert adam['exp_avg'].count_nonzero() > 0 and adam['exp_avg_sq'].count_nonzero() > 0
+        assert adam['step'].item() == 1
+    sharded = module.embedding.sharded_state_dict()
+    assert set(sharded) == {'tables.0.weight', 'tables.1.weight'}
+    assert all(value.dtype == torch.bfloat16 for value in sharded.values())
+    exported = {}
+    bridge._set_layer_engram(SimpleNamespace(engram=module), exported, to_mcore=False)
+    assert exported['engram.embed.weight'].dtype == torch.bfloat16
+    assert 'engram.embed.weight_scale_inv' not in exported
+    assert config.hf_config.quantization_config == {'scale_fmt': 'ue8m0'}
+
+
 def test_cpu_offload_survives_complete_engram_initialization(monkeypatch):
     from mcore_bridge.model.modules.engram_cpu import CPUShardedEmbedding
 
