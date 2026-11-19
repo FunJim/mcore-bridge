@@ -33,15 +33,16 @@ BASE_WHEEL = os.environ.get('MEGATRON_PATCH_BASE_WHEEL')
 DSA_PATH = 'megatron/core/transformer/experimental_attention_variant/dsa.py'
 MASK_PATH = 'megatron/core/transformer/experimental_attention_variant/dsa_masking.py'
 ADAPTER_PATH = 'megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py'
-HELPERS = {'_compute_index_scores', '_kpool_compress_keys', '_expand_pools_to_tokens',
-           '_append_tail_to_topk', 'fused_qk_topk_kpool'}
-MASK_HELPERS = {'build_valid_mask_from_starts_ends', 'apply_starts_ends_mask_to_scores',
-                'normalize_varlen_bounds'}
+HELPERS = {
+    '_compute_index_scores', '_kpool_compress_keys', '_expand_pools_to_tokens', '_append_tail_to_topk',
+    '_kpool_ordered_topk', 'fused_qk_topk_kpool'
+}
+MASK_HELPERS = {'build_valid_mask_from_starts_ends', 'apply_starts_ends_mask_to_scores', 'normalize_varlen_bounds'}
 
 
 def bundled_sources():
-    spec = importlib.util.spec_from_file_location(
-        '_kpool_installer_test', ROOT / 'src/mcore_bridge/tools/apply_megatron_patch.py')
+    spec = importlib.util.spec_from_file_location('_kpool_installer_test',
+                                                  ROOT / 'src/mcore_bridge/tools/apply_megatron_patch.py')
     installer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(installer)
     entries = installer.patch_files(False)
@@ -71,8 +72,10 @@ def compile_functions(text, names, module):
     if {node.name for node in body} != names:
         raise AssertionError('Missing isolated helper')
     future = ast.parse('from __future__ import annotations').body
-    exec(compile(ast.fix_missing_locations(ast.Module(body=future + body, type_ignores=[])),
-                 '<bundled-helpers>', 'exec'), module.__dict__)
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=future + body, type_ignores=[])), '<bundled-helpers>', 'exec'),
+        module.__dict__)
 
 
 def load_sources(sources):
@@ -96,32 +99,44 @@ def load_sources(sources):
     sys.modules[adapter.__name__] = adapter
     package.dsa_kpool_kernels = adapter
     exec(compile(adapter_text, '<bundled-kpool>', 'exec'), adapter.__dict__)
-    cls = next(node for node in ast.parse(dsa_text).body
-               if isinstance(node, ast.ClassDef) and node.name == 'DSAttention')
+    cls = next(
+        node for node in ast.parse(dsa_text).body if isinstance(node, ast.ClassDef) and node.name == 'DSAttention')
     constructor = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == '__init__')
 
     class Base:
+
         def __init__(self, config):
             self.config = config
 
-    isolated = ast.ClassDef(name='DSAttention', bases=[ast.Name(id='MegatronModule', ctx=ast.Load())],
-                            keywords=[], body=[constructor], decorator_list=[])
+    isolated = ast.ClassDef(
+        name='DSAttention',
+        bases=[ast.Name(id='MegatronModule', ctx=ast.Load())],
+        keywords=[],
+        body=[constructor],
+        decorator_list=[])
     namespace = dsa.__dict__
-    namespace.update(MegatronModule=Base, build_module=lambda *args, **kwargs: kwargs['config'].indexer,
-                     dsa_layout=types.SimpleNamespace(normalize_cp_comm_type=lambda value: value),
-                     logger=logging.getLogger(__name__))
+    namespace.update(
+        MegatronModule=Base,
+        build_module=lambda *args, **kwargs: kwargs['config'].indexer,
+        dsa_layout=types.SimpleNamespace(normalize_cp_comm_type=lambda value: value),
+        logger=logging.getLogger(__name__))
     future = ast.parse('from __future__ import annotations').body
-    exec(compile(ast.fix_missing_locations(ast.Module(body=future + [isolated], type_ignores=[])),
-                 '<bundled-constructor>', 'exec'), namespace)
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=future + [isolated], type_ignores=[])), '<bundled-constructor>',
+            'exec'), namespace)
     forward = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'forward')
-    branch = next(node for node in ast.walk(forward)
-                  if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == 'is_kpool')
+    branch = next(
+        node for node in ast.walk(forward)
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == 'is_kpool')
     wrapper = ast.parse('def dispatch(self, q, k, weights, tp_group, sequence_parallel_query_is_local, '
                         'float_mask, varlen_starts, varlen_ends, key_positions, cu_seqlens_kv, '
                         'packed_thd, kpool_gate_score):\n    pass\n').body[0]
     wrapper.body = branch.body + [ast.Return(value=ast.Name(id='topk_indices', ctx=ast.Load()))]
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
-                 '<bundled-selection-branch>', 'exec'), namespace)
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), '<bundled-selection-branch>',
+            'exec'), namespace)
     return adapter, dsa
 
 
@@ -149,39 +164,54 @@ def sample(case='packed', dtype=None, batch=1, lengths=(7, 13, 21)):
         q.mul_(1e-4)
     elif case == 'empty_rows':
         ends = starts.clone()
-    kwargs = dict(q=q, k=k, weights=weights, index_topk=16, pool_size=4,
-                  gate_score=gate, ape=ape, varlen_starts=starts, varlen_ends=ends,
-                  cu_seqlens_kv=cu, use_relu=True, always_select_tail=True)
+    kwargs = dict(
+        q=q,
+        k=k,
+        weights=weights,
+        index_topk=16,
+        pool_size=4,
+        gate_score=gate,
+        ape=ape,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        cu_seqlens_kv=cu,
+        use_relu=True,
+        always_select_tail=True)
     if case == 'explicit_positions':
         kwargs.update(key_positions=positions * 2, varlen_starts=starts * 2, varlen_ends=ends * 2)
     return kwargs
 
 
 def new_attention(dsa, mode='tp_dedup', policy='first', group=None):
-    indexer = types.SimpleNamespace(index_kpool=4, index_kpool_compress_ape=sample()['ape'],
-                                    index_kpool_always_select_tail=True)
-    config = types.SimpleNamespace(num_layers=1, dsa_indexer_topk=16, dsa_indexer_topk_freq=1,
-                                   dsa_indexer_skip_topk_offset=0, dsa_indexer_loss_coeff=0,
-                                   dsa_indexer_kpool=4, kv_channels=8, dsa_indexer_scoring_relu=True,
-                                   indexer=indexer)
+    indexer = types.SimpleNamespace(
+        index_kpool=4, index_kpool_compress_ape=sample()['ape'], index_kpool_always_select_tail=True)
+    config = types.SimpleNamespace(
+        num_layers=1,
+        dsa_indexer_topk=16,
+        dsa_indexer_topk_freq=1,
+        dsa_indexer_skip_topk_offset=0,
+        dsa_indexer_loss_coeff=0,
+        dsa_indexer_kpool=4,
+        kv_channels=8,
+        dsa_indexer_scoring_relu=True,
+        indexer=indexer)
     groups = types.SimpleNamespace(tp=group, cp=None)
     with patch.dict(os.environ, {'MCORE_KPOOL_SELECTION_MODE': mode, 'MCORE_KPOOL_VALIDATE': policy}):
-        return dsa.DSAttention(config, types.SimpleNamespace(indexer=object()), 1, None, 'self',
-                               softmax_scale=1.0, pg_collection=groups)
+        return dsa.DSAttention(
+            config, types.SimpleNamespace(indexer=object()), 1, None, 'self', softmax_scale=1.0, pg_collection=groups)
 
 
 def dispatch(dsa, attention, kwargs, group=None, local=False):
-    return dsa.dispatch(attention, kwargs['q'], kwargs['k'], kwargs['weights'], group, local,
-                        kwargs.get('mask'), kwargs.get('varlen_starts'), kwargs.get('varlen_ends'),
-                        kwargs.get('key_positions'), kwargs.get('cu_seqlens_kv'),
+    return dsa.dispatch(attention, kwargs['q'], kwargs['k'], kwargs['weights'], group, local, kwargs.get('mask'),
+                        kwargs.get('varlen_starts'), kwargs.get('varlen_ends'), kwargs.get('key_positions'),
+                        kwargs.get('cu_seqlens_kv'),
                         kwargs.get('cu_seqlens_kv') is not None, kwargs['gate_score'])
 
 
 def distributed_worker(rank, rendezvous, sources):
     torch.set_num_threads(1)
     adapter, dsa = load_sources(sources)
-    dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=4,
-                            timeout=timedelta(seconds=45))
+    dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=45))
     try:
         group = dist.group.WORLD
         for case in ('packed', 'unpacked', 'zigzag', 'ties', 'near_ties', 'explicit_positions', 'empty_rows'):
@@ -259,6 +289,7 @@ def distributed_worker(rank, rendezvous, sources):
 
 @unittest.skipUnless(torch is not None and BASE_WHEEL, 'requires Torch and MEGATRON_PATCH_BASE_WHEEL')
 class KPoolTPDedupTest(unittest.TestCase):
+
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(1)
@@ -292,8 +323,8 @@ class KPoolTPDedupTest(unittest.TestCase):
             self.assertEqual(sum(b - a for a, b in ranges), queries)
             self.assertTrue(all(b == ranges[i + 1][0] for i, (_, b) in enumerate(ranges[:-1])))
             self.assertTrue(all(a in (0, queries) or a % 256 == 0 for a, _ in ranges))
-        self.assertEqual(self.adapter.shard_ranges(16384, 256, 4),
-                         [(0, 4096), (4096, 8192), (8192, 12288), (12288, 16384)])
+        self.assertEqual(
+            self.adapter.shard_ranges(16384, 256, 4), [(0, 4096), (4096, 8192), (8192, 12288), (12288, 16384)])
         for args in ((-1, 8, 4), (1, 0, 4), (1, 8, 0)):
             with self.assertRaises(ValueError):
                 self.adapter.shard_ranges(*args)
@@ -301,22 +332,22 @@ class KPoolTPDedupTest(unittest.TestCase):
     def test_multiple_chunks_select_same_order(self):
         for case in ('packed', 'zigzag', 'ties', 'explicit_positions'):
             kwargs = sample(case)
-            pooled, bases = self.adapter._prepare(kwargs['k'], kwargs['gate_score'], kwargs['ape'],
-                                                  4, kwargs['cu_seqlens_kv'])
-            starts, ends, positions = self.adapter._bounds(kwargs['q'], bases, 4, kwargs['varlen_starts'],
-                                                          kwargs['varlen_ends'], kwargs.get('key_positions'),
-                                                          kwargs['cu_seqlens_kv'])
+            pooled, bases = self.adapter._prepare(kwargs['k'], kwargs['gate_score'], kwargs['ape'], 4,
+                                                  kwargs['cu_seqlens_kv'])
+            starts, ends, positions = self.adapter._bounds(kwargs['q'], bases, 4,
+                                                           kwargs['varlen_starts'], kwargs['varlen_ends'],
+                                                           kwargs.get('key_positions'), kwargs['cu_seqlens_kv'])
             pieces = []
             for lo, hi in self.adapter.shard_ranges(41, 8, 4):
                 scores = self.dsa._compute_index_scores(kwargs['q'][lo:hi], kwargs['weights'][lo:hi], pooled)
-                scores = self.dsa.dsa_masking.apply_starts_ends_mask_to_scores(
-                    scores, starts[lo:hi], ends[lo:hi], positions)
+                scores = self.dsa.dsa_masking.apply_starts_ends_mask_to_scores(scores, starts[lo:hi], ends[lo:hi],
+                                                                               positions)
                 pieces.append(self.adapter._select(scores, bases, starts[lo:hi], ends[lo:hi], 16, 4, True))
             _, expected = self.dsa.fused_qk_topk_kpool(**kwargs)
             self.assertTrue(torch.equal(torch.cat(pieces, dim=1), expected))
 
     def test_empty_pools_tail_and_output_lifetime(self):
-        for lengths in ((1, 2), (3, 5), (4,), (7, 9)):
+        for lengths in ((1, 2), (3, 5), (4, ), (7, 9)):
             for tail in (False, True):
                 kwargs = sample(lengths=lengths)
                 kwargs['always_select_tail'] = tail
@@ -327,8 +358,9 @@ class KPoolTPDedupTest(unittest.TestCase):
                 self.assertEqual(actual.indices.shape[-1], 19 if tail else 16)
                 valid = actual.indices >= 0
                 selected = actual.indices.clamp_min(0).long()
-                self.assertFalse(torch.any(valid & ((selected < kwargs['varlen_starts'][None, :, None])
-                                                    | (selected >= kwargs['varlen_ends'][None, :, None]))))
+                self.assertFalse(
+                    torch.any(valid & ((selected < kwargs['varlen_starts'][None, :, None])
+                                       | (selected >= kwargs['varlen_ends'][None, :, None]))))
 
     def test_batch_mask_and_local_fallback(self):
         for kwargs in (sample(batch=2), sample()):
@@ -363,8 +395,8 @@ class KPoolTPDedupTest(unittest.TestCase):
     def test_real_tp4_and_nonzero_subgroup(self):
         with tempfile.TemporaryDirectory() as directory:
             rendezvous = pathlib.Path(directory, 'rendezvous').as_uri()
-            context = torch.multiprocessing.spawn(distributed_worker,
-                                                  args=(rendezvous, self.sources), nprocs=4, join=False)
+            context = torch.multiprocessing.spawn(
+                distributed_worker, args=(rendezvous, self.sources), nprocs=4, join=False)
             deadline = time.monotonic() + 120
             try:
                 while not context.join(timeout=1):
