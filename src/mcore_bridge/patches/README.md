@@ -23,6 +23,7 @@ Included changes and provenance:
 | Official bridge GLM patch | Original patch from bridge `9d610ff`; GLM numerics from NVIDIA/Megatron-LM PR #7054 `be805e55`, chunked index scoring from `3fceb0715`, expert norm / FP32 attributes from the original patch. Original NVIDIA source licenses and attribution retained. | Existing `tests/test_glm5_hybrid.py`, `tests/test_hybrid_compat.py`; distributed GLM block preflight |
 | FP32 optimizer shards | Detach native FP32 views so CPU offload receives leaf tensors; storage remains shared. Maintained in this repository by commit `eb26203`. | `verify_glm53_fp32_shards.py`: offload 0/0.5/1, AdamW update, optimizer state restore |
 | Weights-only optimizer reload | Refresh distributed FP32 masters from loaded model shards before refreshing HybridDeviceOptimizer CPU copies. CPU copies of native FP32 parameters must also be refreshed. Otherwise the first update can overwrite loaded weights with stale or nonfinite values. Reproduced during GLM weights-only continuation with CPU offload. | `verify_glm53_optimizer_reload.py`: real shard builder, partial ranges, FP32/BF16, offload 0/0.5/1, overlap on/off, checkpoint-state input, stale/NaN controls, zero-gradient preservation and AdamW update parity |
+| Adam/HDO optimizer-state resume | Keep scalar Adam step counters in checkpoint parameter-group metadata, outside DP parameter shards. Restore native Adam state and fused Adam group counters, synchronize Hybrid child state and CPU parameter copies after loading, and prevent later group synchronization from resetting fused Adam steps. Missing or incompatible required parameter/moment tensors still fail instead of silently skipping restore. | `verify_glm53_optimizer_resume_cpu.py`: reordered groups, distinct steps, invalid/missing counters, shard-template step exclusion, required moment validation and subsequent updates. `verify_glm53_optimizer_resume_gpu.py`: real HDO/DCP save and cold restore, FP32/BF16 distributed masters, offload 0/0.5/1, overlap on/off, old-checkpoint negative control and DP2 |
 | LayerWise optimizer gradient statistics | Backport NVIDIA/Megatron-LM PR #6099 (`a650054ff593cecfc48708a4e3f1be80573728b7`): propagate TP and expert TP groups to the wrapped child optimizers and zero counting. Uses the bundle's existing expert TP duplicate filtering; fixes expert bias undercounting when TP and ETP differ. | `test_glm53_layer_wise_optimizer.py`: actual patched constructor, gradient norm and zero counting on CPU across TP/ETP topologies, FP32/BF16 wrapping, decoupled gradients, and missing-group negative controls |
 | TileLang shapes | Support GLM's zero RoPE channels and pad KPool top-k slots without changing selected tokens. Maintained in this repository by commit `ed3f9c6`. | `verify_glm53_dsa.py`: output/gradient comparison, 73728-token fused forward/backward |
 | KPool CP | Gather gate scores and reorder them with indexer keys across context-parallel ranks. Maintained in this repository by commit `f5cca49`. | `verify_glm53_dsa_cp.py`: CPU CP1/CP8 output/gradient parity, packed sequences, negative controls; 4-node CP8 preflight |
@@ -46,7 +47,7 @@ python -m mcore_bridge.tools.apply_megatron_patch --check
 ```
 
 When an environment setup script pins `MCORE_BRIDGE_REF`, select a full bridge
-commit containing the #6099 backport before building these wheels. A wheel built
+commit containing the #6099 backport and Adam/HDO resume fix before building these wheels. A wheel built
 from an older bridge commit still contains the older patch, even if this checkout
 has been updated. The supported Megatron baseline remains `ee743d3ef228`.
 
@@ -113,6 +114,39 @@ For the reload negative control, run the same script with `--expect-stale` in an
 isolated environment containing the previous patch from `314c649`. Once a newly
 prepared environment passes these checks, omit the experiment-specific
 `hybrid_reload_fix.py` plugin. Dataset window plugins remain independent.
+
+For Adam/HDO `dp_reshardable` optimizer-state resume, run the CPU boundary tests
+against the installed patch. GPU save and load must run in separate Python
+processes so the load starts from fresh optimizer state. Each output directory
+must be new; no model or training checkpoint is loaded by these small regressions:
+
+```bash
+set -euo pipefail
+: "${GLM_RESUME_TEST_OUTPUT:?Set an unused shared experiment directory}"
+GLM_SITE=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+python tests/glm53_patch_regression/verify_glm53_optimizer_resume_cpu.py --root "$GLM_SITE"
+for fraction in 0 0.5 1; do
+    for overlap in 0 1; do
+        for phase in save load; do
+            python tests/glm53_patch_regression/verify_glm53_optimizer_resume_gpu.py \
+                --root "$GLM_SITE" --output "$GLM_RESUME_TEST_OUTPUT" \
+                --fraction "$fraction" --overlap "$overlap" --phase "$phase"
+        done
+    done
+done
+```
+
+For DP2, use a different output directory and run each phase with
+`torchrun --standalone --nproc_per_node=2` plus `--distributed`, preserving the
+same offload/overlap settings. For old-checkpoint compatibility, save with the
+previous `71a6d206` runtime and then load with the fixed runtime; the old loader
+on that same checkpoint reproduces `KeyError: 'step'` with `--expect-load-failure`.
+Do not use that negative-control option as successful resume validation.
+
+The resume fix is bundled directly in `megatron_glm53_dev.patch`; no additional
+optimizer-resume overlay or training-rank plugin is needed. Validation uses
+synthetic tensors and has not covered a full GLM checkpoint, 256 ranks, or all
+other checkpoint formats. It does not change KPool selection or replay.
 
 For the CPU CP regression's negative control, extract
 `src/mcore_bridge/patches/megatron_glm53_dev.patch` from this repository's
