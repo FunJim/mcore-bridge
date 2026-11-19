@@ -638,7 +638,7 @@ index f1eeda16ae8f19b7ab29745d9a0b777b9acba4cc..b5f92f5ef8d05a8104cf003686d0245c
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c8c194007 100644
+index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..83ba91ecf7fc9e9d26c143c45ee99443c574c46c 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -668,23 +668,38 @@ def _compute_index_scores(
@@ -697,7 +697,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
  
      # Transpose to [batch, seqlen_q, seqlen_k].
      index_scores = index_scores.transpose(0, 1)
-@@ -741,6 +756,116 @@ def fused_qk_topk_naive(
+@@ -741,6 +756,136 @@ def fused_qk_topk_naive(
      return index_scores, topk_indices
  
  
@@ -739,6 +739,26 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
 +    tail = start[:, None] + offsets
 +    tail = tail.masked_fill(offsets >= count[:, None], -1).to(topk_result.dtype)
 +    return torch.cat((topk_result, tail), dim=-1)
++
++
++def _kpool_ordered_topk(scores, count):
++    """Score descending, exact ties by ascending pool column, with bounded row workspace."""
++    shape = scores.shape[:-1] + (count,)
++    values = scores.new_empty(shape)
++    indices = torch.empty(shape, dtype=torch.int64, device=scores.device)
++    if count == 0:
++        return values, indices
++    # Copy only K indices into the result so slices never retain full sort storage.
++    # The row bound limits explicit indices; ATen can allocate additional workspace.
++    chunk_rows = max(1, (64 * 1024 * 1024) // max(1, scores.shape[0] * scores.shape[-1] * 16))
++    for start in range(0, scores.shape[1], chunk_rows):
++        end = min(start + chunk_rows, scores.shape[1])
++        order = torch.argsort(scores[:, start:end], dim=-1, descending=True, stable=True)
++        chosen = order[..., :count]
++        indices[:, start:end].copy_(chosen)
++        values[:, start:end].copy_(torch.gather(scores[:, start:end], -1, chosen))
++        del chosen, order
++    return values, indices
 +
 +
 +def fused_qk_topk_kpool(
@@ -783,7 +803,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
 +    budget = index_topk // pool_size
 +    select = min(budget, pooled.shape[0])
 +    if select:
-+        values, ids = scores.topk(select, dim=-1)
++        values, ids = _kpool_ordered_topk(scores, select)
 +        ids = ids.masked_fill(values == float('-inf'), -1)
 +    else:
 +        ids = torch.empty(scores.shape[:-1] + (0,), dtype=torch.long, device=q.device)
@@ -814,7 +834,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
  def fwd_fused_indexer_loss_naive(
      q,
      weights,
-@@ -975,36 +1100,47 @@ def bwd_fused_indexer_loss_naive(
+@@ -975,36 +1120,47 @@ def bwd_fused_indexer_loss_naive(
      grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
      del grad_index_scores
  
@@ -888,7 +908,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
  
      return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
  
-@@ -1443,7 +1579,10 @@ class DSAIndexer(MegatronModule):
+@@ -1443,7 +1599,10 @@ class DSAIndexer(MegatronModule):
          self.pg_collection = pg_collection
  
          # Initialize Position Embedding.
@@ -900,7 +920,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
              self.rotary_pos_emb = RotaryEmbedding(
                  self.qk_pos_emb_head_dim,
                  rotary_percent=self.config.rotary_percent,
-@@ -1520,6 +1659,21 @@ class DSAIndexer(MegatronModule):
+@@ -1520,6 +1679,21 @@ class DSAIndexer(MegatronModule):
                  skip_weight_param_allocation=False,
                  parallel_mode="duplicated",
              )
@@ -922,7 +942,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
          self._weights_proj_te_gemm_supported: Optional[bool] = None
          # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
          # should be averaged during final gradient synchronization.
-@@ -1557,6 +1711,8 @@ class DSAIndexer(MegatronModule):
+@@ -1557,6 +1731,8 @@ class DSAIndexer(MegatronModule):
          rotary_pos_sin: Optional[torch.Tensor] = None,
      ):
          """Apply RoPE to the input tensor."""
@@ -931,7 +951,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
          if rotary_pos_cos is not None or rotary_pos_sin is not None:
              assert rotary_pos_cos is not None and rotary_pos_sin is not None
              assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
-@@ -1623,14 +1779,17 @@ class DSAIndexer(MegatronModule):
+@@ -1623,14 +1799,17 @@ class DSAIndexer(MegatronModule):
          # =========================================
          # Prepare RoPE params
          # =========================================
@@ -956,7 +976,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
              rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                  rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
              )
-@@ -1716,6 +1875,8 @@ class DSAIndexer(MegatronModule):
+@@ -1716,6 +1895,8 @@ class DSAIndexer(MegatronModule):
          # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
          weights = self._project_indexer_weights(x)
          weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
@@ -965,7 +985,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
  
          return q, k, weights
  
-@@ -1748,9 +1909,20 @@ class DSAIndexer(MegatronModule):
+@@ -1748,9 +1929,20 @@ class DSAIndexer(MegatronModule):
          q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
  
          # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
@@ -989,7 +1009,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
  
          return index_scores, topk_indices
  
-@@ -1975,6 +2147,18 @@ class DSAttention(MegatronModule):
+@@ -1975,6 +2167,18 @@ class DSAttention(MegatronModule):
          if pg_collection is None:
              pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
          self.pg_collection = pg_collection
@@ -1008,7 +1028,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
  
          self.indexer = None
          if not self.skip_topk:
-@@ -2382,6 +2566,9 @@ class DSAttention(MegatronModule):
+@@ -2382,6 +2586,9 @@ class DSAttention(MegatronModule):
              assert self.indexer is not None
              with torch.enable_grad() if use_indexer_loss else torch.no_grad():
                  q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
@@ -1018,7 +1038,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
                  if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                      if kv_reorder_idx is None:
                          kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
-@@ -2392,6 +2579,11 @@ class DSAttention(MegatronModule):
+@@ -2392,6 +2599,11 @@ class DSAttention(MegatronModule):
                              f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
                          )
                      k = k.index_select(0, kv_reorder_idx)
@@ -1030,7 +1050,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
                  if sequence_parallel_tp and q.size(0) != sq:
                      if (
                          q.size(0) != sequence_parallel_tp_full_rows
-@@ -2438,7 +2630,8 @@ class DSAttention(MegatronModule):
+@@ -2438,7 +2650,8 @@ class DSAttention(MegatronModule):
              )
  
          fused_output = None
@@ -1040,7 +1060,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2774,55 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2794,55 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
@@ -1099,7 +1119,7 @@ index 9193f4e00aea298e1200f29a9c6d6798c9e361ef..c7ca90051b8428f9007fbec444c1e81c
                  fused_topk = dsa_kernels.run_fused_qk_topk(
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f1c7583322fff5b99e782c07c00dda2888671fe9
+index 0000000000000000000000000000000000000000..a10090ee8f9470094f1273675ab01e8a49a9da73
 --- /dev/null
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa_kpool_kernels.py
 @@ -0,0 +1,325 @@
@@ -1272,11 +1292,11 @@ index 0000000000000000000000000000000000000000..f1c7583322fff5b99e782c07c00dda28
 +
 +
 +def _select(scores, bases, starts, ends, index_topk, pool_size, tail):
-+    from .dsa import _append_tail_to_topk, _expand_pools_to_tokens
++    from .dsa import _append_tail_to_topk, _expand_pools_to_tokens, _kpool_ordered_topk
 +    budget = index_topk // pool_size
 +    count = min(budget, bases.numel())
 +    if count:
-+        values, ids = scores.topk(count, dim=-1, sorted=True)
++        values, ids = _kpool_ordered_topk(scores, count)
 +        ids = ids.masked_fill(values == float("-inf"), -1)
 +    else:
 +        ids = torch.empty(scores.shape[:-1] + (0,), dtype=torch.int64, device=scores.device)
