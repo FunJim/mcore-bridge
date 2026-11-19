@@ -38,18 +38,28 @@ def bridge_modules():
 def verify_scores(a, b, root, label):
     mask_a = torch.isneginf(a)
     mask_b = torch.isneginf(b)
-    if not torch.equal(mask_a, mask_b) or torch.isnan(a).any() or torch.isnan(b).any():
-        raise AssertionError('Invalid score mask or NaN: ' + label)
+    invalid = (not torch.equal(mask_a, mask_b) or bool(torch.isnan(a).any()) or bool(torch.isnan(b).any())
+               or bool(torch.isposinf(a).any()) or bool(torch.isposinf(b).any()))
     valid = ~mask_a
-    maximum = (a[valid] - b[valid]).abs().max().item() if valid.any() else 0.0
-    if not torch.equal(a[valid], b[valid]):
-        row = int(torch.nonzero(((a != b) & valid).any(-1), as_tuple=False)[0, -1])
-        torch.save({
-            'reference': a[:, row].cpu(),
-            'candidate': b[:, row].cpu(),
-            'max_delta': maximum,
-            'label': label
-        }, root / f'score-mismatch-rank{dist.get_rank() if dist.is_initialized() else 0}.pt')
+    differs = invalid or not torch.equal(a[valid], b[valid])
+    maximum = (a[valid] - b[valid]).abs().max().item() if not invalid and valid.any() else 0.0
+    failure = torch.tensor(int(differs), device=a.device, dtype=torch.int32)
+    if dist.is_initialized():
+        dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+    if failure.item():
+        if differs:
+            changed = (a != b) | torch.isnan(a) | torch.isnan(b) | torch.isposinf(a) | torch.isposinf(b)
+            row = int(torch.nonzero(changed.any(-1), as_tuple=False)[0, -1])
+            try:
+                torch.save(
+                    {
+                        'reference': a[:, row].cpu(),
+                        'candidate': b[:, row].cpu(),
+                        'max_delta': maximum,
+                        'label': label
+                    }, root / f'score-mismatch-rank{dist.get_rank() if dist.is_initialized() else 0}.pt')
+            except OSError as error:
+                print(f'Failed to save score mismatch: {error}', flush=True)
         raise AssertionError('Score drift ' + label + ': ' + str(maximum))
     return maximum
 
@@ -182,6 +192,9 @@ def main():
                             assert torch.equal(first.indices, expected) and torch.equal(second.indices, expected)
                             stats = replay.replay_stats()
                             assert stats['live_bytes'] == stats['live_entries'] == 0
+                            expected_calls = first_calls if mode == 'off' else (
+                                first_calls * 2 if mode == 'observe' else first_calls + 1)
+                            assert len(score_calls) == expected_calls, (mode, score_calls)
                         print(
                             json.dumps({
                                 'case': case,

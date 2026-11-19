@@ -346,44 +346,6 @@ class KPoolTPDedupTest(unittest.TestCase):
             _, expected = self.dsa.fused_qk_topk_kpool(**kwargs)
             self.assertTrue(torch.equal(torch.cat(pieces, dim=1), expected))
 
-    def test_ordered_topk_matches_exact_tie_oracle(self):
-        generator = torch.Generator().manual_seed(713)
-        cases = [
-            torch.zeros(2, 7, 37),
-            torch.randn(2, 7, 37, generator=generator),
-            torch.randn(2, 7, 37, generator=generator).bfloat16().float(),
-            torch.tensor([2.] * 4 + [1.] * 20 + [-2.] * 13).repeat(2, 7, 1),
-            torch.tensor([1., 1.0000001192092896, 0.9999999403953552]).repeat(2, 7, 13)[..., :37]
-        ]
-        masked = torch.full((2, 7, 37), float('-inf'))
-        for row in range(7):
-            masked[:, row, :row] = torch.arange(row).float()
-        cases.append(masked)
-        for scores in cases:
-            for count in (0, 1, 5, 16, 37):
-                expected = torch.tensor(
-                    [[sorted(range(37), key=lambda col: (-float(row[col]), col))[:count] for row in batch]
-                     for batch in scores],
-                    dtype=torch.int64)
-                values, indices = self.dsa._kpool_ordered_topk(scores, count)
-                self.assertTrue(torch.equal(indices, expected))
-                self.assertTrue(torch.equal(values, torch.gather(scores, -1, expected)))
-                self.assertEqual(indices.untyped_storage().nbytes(), indices.numel() * indices.element_size())
-
-    def test_large_tie_selection_matches_query_chunks(self):
-        scores = torch.zeros(1, 257, 8192)
-        bases = torch.arange(8192) * 4
-        starts = torch.zeros(257, dtype=torch.int64)
-        ends = torch.full_like(starts, 32768)
-        whole = self.adapter._select(scores, bases, starts, ends, 2048, 4, True)
-        for width in (1, 64, 256):
-            pieces = [
-                self.adapter._select(scores[:, lo:lo + width], bases, starts[lo:lo + width], ends[lo:lo + width], 2048,
-                                     4, True) for lo in range(0, 257, width)
-            ]
-            self.assertTrue(torch.equal(torch.cat(pieces, dim=1), whole))
-        self.assertTrue(torch.equal(whole[0, 0, :2048], torch.arange(2048, dtype=torch.int32)))
-
     def test_empty_pools_tail_and_output_lifetime(self):
         for lengths in ((1, 2), (3, 5), (4, ), (7, 9)):
             for tail in (False, True):

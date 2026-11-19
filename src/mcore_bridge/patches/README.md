@@ -27,7 +27,7 @@ Included changes and provenance:
 | LayerWise optimizer gradient statistics | Backport NVIDIA/Megatron-LM PR #6099 (`a650054ff593cecfc48708a4e3f1be80573728b7`): propagate TP and expert TP groups to the wrapped child optimizers and zero counting. Uses the bundle's existing expert TP duplicate filtering; fixes expert bias undercounting when TP and ETP differ. | `test_glm53_layer_wise_optimizer.py`: actual patched constructor, gradient norm and zero counting on CPU across TP/ETP topologies, FP32/BF16 wrapping, decoupled gradients, and missing-group negative controls |
 | TileLang shapes | Support GLM's zero RoPE channels and pad KPool top-k slots without changing selected tokens. Maintained in this repository by commit `ed3f9c6`. | `verify_glm53_dsa.py`: output/gradient comparison, 73728-token fused forward/backward |
 | KPool CP | Gather gate scores and reorder them with indexer keys across context-parallel ranks. Maintained in this repository by commit `f5cca49`. | `verify_glm53_dsa_cp.py`: CPU CP1/CP8 output/gradient parity, packed sequences, negative controls; 4-node CP8 preflight |
-| KPool ordered selection | Use one selector in reference and TP-dedup paths: score descending, exact ties by ascending pool column. Select query rows in bounded chunks and copy K-wide results so they do not retain full sorting storage. This specifies previously undefined cutoff-tie choices; it does not perturb scores or weaken validation. | `test_kpool_tp_dedup.py`: lexicographic oracle, cutoff ties, adjacent FP32 values, masks, batching, query chunking and compact result storage. `verify_glm53_kpool_ordered_selection.py`: production 32-head/128-dimension scoring, multi-chunk TP4/NCCL and off/observe/replay with both head-sum settings |
+| KPool ordered selection | Use one selector in reference and TP-dedup paths: score descending, exact ties by ascending pool column. Select query rows in bounded chunks and copy K-wide results so they do not retain full sorting storage. This specifies previously undefined cutoff-tie choices; it does not perturb scores or weaken validation. | `test_kpool_ordered_topk.py`: lexicographic oracle, cutoff ties, adjacent FP32 values, masks, batching, empty inputs, noncontiguous views, query chunking and compact result storage. `verify_glm53_kpool_ordered_selection.py`: production 32-head/128-dimension scoring, multi-chunk TP4/NCCL and off/observe/replay with both head-sum settings |
 
 The complete runtime patch is maintained on `feat/glm53-flash-support`;
 its official GLM portion was introduced at `85f6680`. Installation and
@@ -100,6 +100,9 @@ python -m torch.distributed.run --nnodes=1 --node_rank=0 \
     --master_addr=127.0.0.1 --master_port=29817 --nproc_per_node=4 \
     tests/glm53_patch_regression/verify_glm53_kpool_ordered_selection.py \
     --root "$GLM_SITE" --output "$KPOOL_REGRESSION_OUTPUT/tp4" --distributed
+python -m torch.distributed.run --nnodes=1 --node_rank=0 \
+    --master_addr=127.0.0.1 --master_port=29823 --nproc_per_node=4 \
+    tests/glm53_patch_regression/verify_glm53_kpool_checkpoint_train.py --steps 2
 ```
 
 These tests preserve strict ordered-index checks and compare valid score values
@@ -109,6 +112,11 @@ costs more than ordinary top-k; the 64 MiB row calculation bounds explicit index
 chunks, not total ATen workspace or output memory. Exact ties may select different
 pools from older wheels whose tie behavior was unspecified. Benchmark matching
 reference and TP-dedup configurations with this same selection rule.
+The checkpoint fixture uses the actual Megatron CheckpointFunction, TileLang
+attention, dropout and two AdamW updates. It checks selected indices and CUDA RNG
+state exactly; gradient comparisons allow the measured small repeat-run variation
+from the existing dKV atomic accumulation. Its small input has empty TP shards;
+the multi-chunk scoring gate above separately exercises work on every TP rank.
 
 For the reload negative control, run the same script with `--expect-stale` in an
 isolated environment containing the previous patch from `314c649`. Once a newly
