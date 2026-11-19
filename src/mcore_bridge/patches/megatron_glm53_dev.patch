@@ -137,10 +137,19 @@ index 762d4aa8dcda1da05712b942b3683aa1fdcb2626..84d8fac7770b4f081863d187d48aef65
              grad_obj = getattr(param, grad_attr)
              data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
 diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-index 45bf910f84dd066c700d83fb919932d2b3732428..cc7600f463bd8288f66e8948501af3e921203dcd 100644
+index 45bf910f84dd066c700d83fb919932d2b3732428..d4afce300a2ba5f9abedd93197921075768d7339 100644
 --- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
 +++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
-@@ -382,6 +382,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+@@ -349,6 +349,8 @@
+                 group_id, _ = param_in_param_group_index[group["params"][0]]
+                 update_group_attrs = self.param_groups[group_id].copy()
+                 del update_group_attrs["params"]
++                # Loaded step initializes child state; it must not reset the GPU counter each update.
++                update_group_attrs.pop("step", None)
+                 new_group.update(update_group_attrs)
+ 
+                 new_param_groups.append(new_group)
+@@ -382,6 +384,10 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
@@ -152,10 +161,18 @@ index 45bf910f84dd066c700d83fb919932d2b3732428..cc7600f463bd8288f66e8948501af3e9
      def _register_load_state_dict_hooks(self):
          def pre_load_state_dict_hook(self, state_dict):
 diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
-index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0e455b77b 100644
+index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..b75b63cc003ca872f6fbdb12a7919dfed7da9877 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
-@@ -470,7 +470,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+@@ -5,6 +5,7 @@
+ import gc
+ import itertools
+ import logging
++import math
+ from collections import ChainMap
+ from dataclasses import replace
+ from logging import getLogger
+@@ -470,7 +471,7 @@
  
                  # fp32 params.
                  elif model_param.type() == 'torch.cuda.FloatTensor':
@@ -164,7 +181,242 @@ index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0
                      model_fp32_params_this_group.append(model_param)
                      shard_fp32_params_this_group.append(shard_model_param)
                      tensor_parallel.copy_tensor_model_parallel_attributes(
-@@ -3167,7 +3167,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+@@ -897,56 +898,93 @@
+         inner_state_dict = self.optimizer.state_dict()
+         state_dict = {}
+ 
+-        # Extract 'step', for non-Apex/TE support.
+-        if not HAVE_APEX_OR_TE:
+-            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
+-            assert len(steps) == 1
+-            step = steps[0]
+-        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+-            step = None
+-            for optimizer in self.optimizer.sub_optimizers:
+-                if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+-                    if len(optimizer.state) == 0:
+-                        continue
+-                    steps = list(set([s["step"].item() for s in optimizer.state.values()]))
+-                    assert len(steps) == 1, f"steps: {optimizer.state}"
+-                    step = steps[0]
+-                    break
+-        elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
+-            # Extract 'step', for TE FusedAdam support.
+-            steps = list(
+-                set(
+-                    [
+-                        g["step"]
+-                        for g in inner_state_dict["param_groups"]
+-                        if len(g["params"]) > 0 and "step" in g
+-                    ]
+-                )
+-            )
+-            assert len(steps) <= 1, f"steps: {steps}"
+-            step = steps[0] if len(steps) == 1 else None
+-
+-        # Optimizer state (do not store parameter state here).
++        # Scalar Adam state is group metadata, not a DP parameter shard.
+         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
+-        for param_group in state_dict["optimizer"]["param_groups"]:
+-            del param_group["params"]
+-            if not HAVE_APEX_OR_TE:
+-                # Native PyTorch param group requires step (i.e., iteration).
+-                param_group["step"] = step
+-            elif (
+-                USING_TE_OPTIMIZER
+-                or USING_APEX_OPTIMIZER
+-                or isinstance(self.optimizer, HybridDeviceOptimizer)
+-            ) and step is not None:
+-                # TE FusedAdam will not accumulate step for empty param groups, so we need to
+-                # align the step across param groups.
+-                param_group["step"] = int(step)
++        optimizer_name = self.config.optimizer
++        if optimizer_name == "muon":
++            optimizer_name = self.config.muon_scalar_optimizer
++        for group_index, group in enumerate(state_dict["optimizer"]["param_groups"]):
++            params = group.pop("params")
++            if optimizer_name != "adam" or not params:
++                continue
++            steps = [inner_state_dict["state"][param]["step"].item() for param in params
++                     if "step" in inner_state_dict["state"].get(param, {})]
++            if isinstance(self.optimizer, HybridDeviceOptimizer):
++                originals = set(self.optimizer.param_groups[group_index]["params"])
++                for child in self.optimizer.sub_optimizers:
++                    for child_group in child.param_groups:
++                        if (not isinstance(child, (torch.optim.Adam, torch.optim.AdamW))
++                                and "step" in child_group and any(
++                                    self.optimizer.inner_param_to_orig_param[p] in originals
++                                    for p in child_group["params"]
++                                )):
++                            steps.append(child_group["step"])
++            elif not steps and "step" in group:
++                steps.append(group["step"])
++            if len(set(steps)) > 1:
++                raise ValueError("Checkpoint Adam steps differ within a group")
++            if not steps:
++                if any(inner_state_dict["state"].get(param) for param in params):
++                    raise ValueError("Checkpoint Adam group is missing a step")
++                # Empty optimizer state is the initialization template, before the first update.
++                steps = [0]
++            value = steps[0]
++            if isinstance(value, torch.Tensor):
++                value = value.item()
++            if (isinstance(value, bool) or not isinstance(value, (int, float))
++                    or not math.isfinite(value) or value < 0 or int(value) != value):
++                raise ValueError("Checkpoint Adam group has an invalid step")
++            group["step"] = int(value)
+ 
+         # Grad scaler state.
+         if self.grad_scaler:
+             state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+ 
+         return state_dict
++
++    def _restore_checkpoint_steps(self, state, param_groups):
++        """Restore Adam scalar state from group metadata, never from shard templates."""
++        optimizer_name = self.config.optimizer
++        if optimizer_name == "muon":
++            optimizer_name = self.config.muon_scalar_optimizer
++        if optimizer_name != "adam":
++            return
++        steps = []
++        for group in param_groups:
++            if not group["params"]:
++                steps.append(None)
++                continue
++            value = group.get("step")
++            if isinstance(value, torch.Tensor):
++                if value.numel() != 1:
++                    raise ValueError("Checkpoint Adam step must be a scalar")
++                value = value.item()
++            if (isinstance(value, bool) or not isinstance(value, (int, float))
++                    or not math.isfinite(value) or value < 0 or int(value) != value):
++                raise ValueError("Checkpoint Adam param group is missing a valid step")
++            steps.append(int(value))
++        native_params = None
++        if isinstance(self.optimizer, HybridDeviceOptimizer):
++            native_params = {self.optimizer.inner_param_to_orig_param[p]
++                             for child in self.optimizer.sub_optimizers
++                             if isinstance(child, (torch.optim.Adam, torch.optim.AdamW))
++                             for child_group in child.param_groups for p in child_group["params"]}
++        for group_index, (group, value) in enumerate(zip(param_groups, steps)):
++            if value is None:
++                continue
++            group["step"] = value
++            for param_order, param_id in enumerate(group["params"]):
++                native_adam = not HAVE_APEX_OR_TE or isinstance(
++                    self.optimizer, (torch.optim.Adam, torch.optim.AdamW)
++                )
++                if native_params is not None:
++                    param = self.optimizer.param_groups[group_index]["params"][param_order]
++                    native_adam = param in native_params
++                if native_adam:
++                    state[param_id]["step"] = torch.tensor(value, dtype=torch.float32, device="cpu")
++                elif isinstance(self.optimizer, HybridDeviceOptimizer):
++                    # FusedAdam uses its group counter, not a per-parameter tensor.
++                    state[param_id].pop("step", None)
+ 
+     def load_state_dict(self, state_dict):
+         """Load the state dict.
+@@ -1085,26 +1123,7 @@
+             # Retrieve existing optimizer state.
+             state_dict_state = inner_state_dict["state"]
+ 
+-        # Extract 'step', for non-Apex/TE support.
+-        if not HAVE_APEX_OR_TE:
+-            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
+-            assert len(steps) == 1
+-            step = torch.tensor(steps[0], dtype=torch.float)
+-
+-            for s in state_dict_state.values():
+-                # Native PyTorch state dict requires step (i.e., iteration).
+-                s["step"] = step
+-        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+-            # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
+-            # has an extra optimizer state "step".
+-            steps = list(
+-                set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g])
+-            )
+-            if len(steps) != 0:
+-                assert len(steps) == 1, f"steps: {steps}"
+-                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
+-                for v in self.optimizer.state.values():
+-                    v["step"] = step.detach().clone()
++        self._restore_checkpoint_steps(state_dict_state, state_dict_param_groups)
+ 
+         # Optimizer.
+         optimizer_state_dict = {"state": state_dict_state, "param_groups": state_dict_param_groups}
+@@ -1157,6 +1176,10 @@
+                 self.load_parameter_state_from_fs_model_space(param_state)
+             else:
+                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
++            if isinstance(self.optimizer, HybridDeviceOptimizer):
++                self.optimizer._sync_hdo_state_to_sub_optimizers()
++                if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
++                    self.optimizer.update_fp32_param_by_new_param()
+ 
+     def _get_main_param_and_optimizer_states(self, model_param):
+         """Return a dict containing the main param and optimizer states corresponding to the input
+@@ -1170,7 +1193,7 @@
+             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
+             tensors = {}
+             for k in self.optimizer.state[sharded_model_param]:
+-                if not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
++                if k == "step" or not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
+                     continue
+                 if isinstance(self.optimizer, HybridDeviceOptimizer):
+                     tensors[k] = self.optimizer.state[sharded_model_param][k]
+@@ -1183,7 +1206,7 @@
+             optim_state = self.optimizer.state[main_param]
+             tensors = {"param": main_param}
+             for k, v in optim_state.items():
+-                if isinstance(v, torch.Tensor):
++                if k != "step" and isinstance(v, torch.Tensor):
+                     tensors[k] = v
+         return tensors
+ 
+@@ -1268,10 +1291,13 @@
+         (e.g., "exp_avg" and "exp_avg_sq" for Adam, or just "exp_avg" for Lion).
+         """
+         group_index, group_order = self.model_param_group_index_map[model_param]
++        for key in ("param",) + self.optimizer_state_keys:
++            if not isinstance(tensors[key], torch.Tensor):
++                raise ValueError(f"Checkpoint optimizer state {key} must be a tensor")
+         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
+             for k, v in tensors.items():
+-                if not isinstance(v, torch.Tensor):
++                if k == "step" or not isinstance(v, torch.Tensor):
+                     continue
+                 if isinstance(self.optimizer, HybridDeviceOptimizer):
+                     if k == "param":
+@@ -1288,17 +1314,20 @@
+             optim_state = self.optimizer.state[main_param]
+             dst_tensors = {"param": main_param}
+             for k, v in optim_state.items():
+-                if isinstance(v, torch.Tensor):
++                if k != "step" and isinstance(v, torch.Tensor):
+                     dst_tensors[k] = v
+             # For fp32 model params, main_param is an autograd-tracked view of
+             # the model param (built without detach() in
+             # _build_model_and_main_param_groups), so the in-place copy must
+             # run under no_grad.
++            for key, destination in dst_tensors.items():
++                value = tensors[key]
++                if (not isinstance(value, torch.Tensor) or value.shape != destination.shape
++                        or value.dtype != destination.dtype):
++                    raise ValueError(f"Checkpoint optimizer state {key} has an incompatible tensor")
+             with torch.no_grad():
+-                for key in dst_tensors:
+-                    if not isinstance(tensors[key], torch.Tensor):
+-                        continue
+-                    dst_tensors[key].copy_(tensors[key])
++                for key, destination in dst_tensors.items():
++                    destination.copy_(tensors[key])
+ 
+     def get_parameter_state_dp_reshardable(self):
+         """Get internal representation of parameter state without any copies and modifications.
+@@ -3167,7 +3196,10 @@
          self.ensure_master_weights_for_param_sync()
          self.assert_master_weights_resident("_copy_model_params_to_main_params")
  
@@ -176,7 +428,7 @@ index ea168831f4ee550cc9ce9f086bc89553d6d5eb06..99a51ebdd25970afa300923000d645c0
              self.optimizer.update_fp32_param_by_new_param()
              return
  
-@@ -3242,6 +3245,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+@@ -3242,6 +3274,10 @@
          copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
          copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
  
