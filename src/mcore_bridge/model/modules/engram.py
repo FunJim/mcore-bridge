@@ -10,6 +10,14 @@ from ...utils import gc_collect, get_logger, use_ngram_embedding_cpu_offload
 from ...utils.megatron_utils import split_cp_inputs
 from .engram_fp8 import Fp8EngramEmbedding, fp8_quant_declared
 
+try:
+    from megatron.core.component_nvtx import component
+except ImportError:
+
+    def component(name: str):
+        return lambda fn: fn
+
+
 # Per-row scale block of the released V4.1 tables (32x32 quantize_config, row-scaled table).
 DEEPSEEK_V41_ENGRAM_BLOCK_SIZE = 32
 
@@ -303,6 +311,7 @@ class DeepseekV41Engram(Engram):
             live = live & (input_ids != token_id)
         return torch.where(live, input_ids, input_ids.new_full((), -1)), live
 
+    @component('engram.hash')
     def _build_hash_ids(self, input_ids: Tensor, cu_seqlens: Tensor | None = None) -> tuple[Tensor, Tensor]:
         masked_ids, live = self._mask_excluded_tokens(input_ids)
         hashes = _build_ngram_hashes(
@@ -325,6 +334,7 @@ class DeepseekV41Engram(Engram):
             length *= get_pg_size(self.tp_group)
         return length
 
+    @component('communication.engram_cp_tokens')
     def _gather_input_ids_for_context_parallel(self, input_ids: Tensor, local_sequence_length: int) -> Tensor:
         """Restore the full token sequence so every rank hashes identical n-gram windows.
 
@@ -354,6 +364,7 @@ class DeepseekV41Engram(Engram):
             return hashes
         return split_cp_inputs(hashes, None, 1, cp_partition_mode='contiguous')
 
+    @component('engram')
     def forward(self, hidden_states: Tensor, input_ids: Tensor, inference_context=None) -> Tensor:
         if inference_context is None:
             inference_context = getattr(self, '_bridge_inference_context', None)
@@ -404,7 +415,7 @@ class DeepseekV41Engram(Engram):
 
         nvtx_range_push('engram.lookup')
         try:
-            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+            memory = self._lookup(hash_ids)
         finally:
             nvtx_range_pop('engram.lookup')
         streams = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size)
@@ -416,6 +427,10 @@ class DeepseekV41Engram(Engram):
         output = score.sigmoid().unsqueeze(-1) * shared_value.unsqueeze(2)
         output = output * live_tokens.transpose(0, 1).unsqueeze(-1).unsqueeze(-1)
         return output.reshape(hidden_states.shape)
+
+    @component('engram.lookup')
+    def _lookup(self, hash_ids: Tensor) -> Tensor:
+        return self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
 
 
 class _DeepseekV41EngramLayerMixin:
