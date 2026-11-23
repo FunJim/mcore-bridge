@@ -28,6 +28,51 @@ def load_methods(component):
 
 class EngramComponentTests(unittest.TestCase):
 
+    def test_split_projection_gate_outputs_gradients_and_adam_are_unchanged(self):
+        methods = load_methods(lambda name: lambda fn: fn)
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(27)
+                holder = SimpleNamespace(
+                    num_streams=2,
+                    hidden_size=8,
+                    value_projection=nn.Linear(12, 8, bias=False).to(dtype),
+                    key_projection=nn.Linear(12, 16, bias=False).to(dtype),
+                    key_norm=nn.RMSNorm(16).to(dtype),
+                    query_norm=nn.RMSNorm(16).to(dtype),
+                )
+                hidden = torch.randn(9, 1, 16, dtype=dtype, requires_grad=True)
+                memory = torch.randn(9, 1, 12, dtype=dtype, requires_grad=True)
+                live = torch.ones(1, 9, dtype=torch.bool)
+                live[:, 3] = False
+                params = [
+                    p for name in ("value_projection", "key_projection", "key_norm", "query_norm")
+                    for p in getattr(holder, name).parameters()
+                ]
+                value = holder.value_projection(memory)
+                key = holder.key_norm(holder.key_projection(memory)).reshape(9, 1, 2, 8)
+                query = holder.query_norm(hidden).reshape(9, 1, 2, 8)
+                dot = torch.sum(key * query, dim=-1) / 8**0.5
+                gate = (dot.abs().clamp_min(1e-6).sqrt() * dot.sign()).sigmoid()
+                expected = (gate[..., None] * value[..., None, :] * live.T[..., None, None]).reshape_as(hidden)
+                grad = torch.randn_like(expected)
+                reference_grads = torch.autograd.grad(expected, (hidden, memory, *params), grad)
+                streams, value, key, query = methods["_project_memory"](holder, hidden, memory)
+                actual = methods["_context_gate"](holder, hidden, streams, value, key, query, live)
+                actual_grads = torch.autograd.grad(actual, (hidden, memory, *params), grad)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                for left, right in zip(reference_grads, actual_grads):
+                    torch.testing.assert_close(left, right, atol=0, rtol=0)
+                # Real FP32 Adam parameters/moments receive the same gradients.
+                masters = [[nn.Parameter(p.detach().float().clone()) for p in params] for _ in range(2)]
+                optimizers = [torch.optim.AdamW(values, lr=1e-3) for values in masters]
+                for values, optimizer, grads in zip(masters, optimizers, (reference_grads, actual_grads)):
+                    for value, g in zip(values, grads[2:]):
+                        value.grad = g.float()
+                    optimizer.step()
+                for left, right in zip(*masters):
+                    torch.testing.assert_close(left, right, atol=0, rtol=0)
+
     def test_real_component_helper_marks_projection_and_backward(self):
         path = os.environ.get("MEGATRON_COMPONENT_NVTX_SOURCE")
         if path is None:

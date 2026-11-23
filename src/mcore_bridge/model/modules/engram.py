@@ -418,19 +418,29 @@ class DeepseekV41Engram(Engram):
             memory = self._lookup(hash_ids)
         finally:
             nvtx_range_pop('engram.lookup')
+        streams, shared_value, key, query = self._project_memory(hidden_states, memory)
+        return self._context_gate(hidden_states, streams, shared_value, key, query, live_tokens)
+
+    @component('engram.lookup')
+    def _lookup(self, hash_ids: Tensor) -> Tensor:
+        return self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+
+    @component('engram.projection')
+    def _project_memory(self, hidden_states: Tensor, memory: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         streams = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size)
         shared_value = self.value_projection(memory)
         key = self.key_norm(self.key_projection(memory)).view_as(streams)
         query = self.query_norm(hidden_states).view_as(streams)
+        return streams, shared_value, key, query
+
+    @component('engram.gate')
+    def _context_gate(self, hidden_states: Tensor, streams: Tensor, shared_value: Tensor, key: Tensor, query: Tensor,
+                      live_tokens: Tensor) -> Tensor:
         score = (key * query).sum(dim=-1) / self.hidden_size**0.5
         score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
         output = score.sigmoid().unsqueeze(-1) * shared_value.unsqueeze(2)
         output = output * live_tokens.transpose(0, 1).unsqueeze(-1).unsqueeze(-1)
         return output.reshape(hidden_states.shape)
-
-    @component('engram.lookup')
-    def _lookup(self, hash_ids: Tensor) -> Tensor:
-        return self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
 
 
 class _DeepseekV41EngramLayerMixin:
