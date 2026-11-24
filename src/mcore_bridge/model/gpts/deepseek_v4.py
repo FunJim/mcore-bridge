@@ -108,6 +108,16 @@ def _apply_mla_rope(t, freqs, *, config, cu_seqlens, cp_group, inverse=False):
     )
 
 
+try:
+    from megatron.core.component_nvtx import component
+except ModuleNotFoundError as error:
+    if error.name != 'megatron.core.component_nvtx':
+        raise
+
+    def component(name):
+        return lambda fn: fn
+
+
 class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
     def __init__(self, config, *args, **kwargs):
@@ -142,6 +152,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         else:
             self._o_group_proj_is_grouped_linear = False
 
+    @component('attention.qkv_projection')
     def get_query_key_value_tensors(
         self,
         hidden_states,
@@ -481,7 +492,20 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
-        # Grouped output
+        core_attn_out = self._grouped_output_projection(core_attn_out)
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, 'attn_proj')
+        with attn_proj_manager as core_attn_out:
+            output, bias = self._final_output_projection(core_attn_out)
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        return output, bias
+
+    @component('attention.grouped_output_projection')
+    def _grouped_output_projection(self, core_attn_out):
         if self._o_group_proj_is_grouped_linear:
             s, b = core_attn_out.size(0), core_attn_out.size(1)
             # [s, b, G*D] -> [G, s*b, D] -> [G*s*b, D]
@@ -499,16 +523,11 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             wo_a_weight = self.linear_o_group_proj.view(self.o_local_groups, self.config.o_lora_rank, -1)
             core_attn_out = torch.einsum('...gd,grd->...gr', core_attn_out, wo_a_weight)
             core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        return core_attn_out
 
-        # =================
-        # Output. [sq, b, h]
-        # =================
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, 'attn_proj')
-        with attn_proj_manager as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
-        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
-
-        return output, bias
+    @component('attention.dense_output_projection')
+    def _final_output_projection(self, core_attn_out):
+        return self.linear_proj(core_attn_out)
 
 
 class DeepseekV4GPTModel(GPTModel):
