@@ -72,6 +72,9 @@ class EngramComponentTests(unittest.TestCase):
                     optimizer.step()
                 for left, right in zip(*masters):
                     torch.testing.assert_close(left, right, atol=0, rtol=0)
+                    for key in ("step", "exp_avg", "exp_avg_sq"):
+                        torch.testing.assert_close(optimizers[0].state[left][key],
+                                                   optimizers[1].state[right][key], atol=0, rtol=0)
 
     def test_real_component_helper_marks_projection_and_backward(self):
         path = os.environ.get("MEGATRON_COMPONENT_NVTX_SOURCE")

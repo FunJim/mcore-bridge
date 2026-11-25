@@ -14,7 +14,8 @@ def _load_callsite():
     helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_apply_mla_rope')
     attention = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'DSv4HybridSelfAttention')
     qkv = next(n for n in attention.body if isinstance(n, ast.FunctionDef) and n.name == 'get_query_key_value_tensors')
-    namespace = {'torch': torch, 'apply_rotary_pos_emb': apply_rotary_pos_emb, 'apply_module': lambda module: module}
+    namespace = {'torch': torch, 'apply_rotary_pos_emb': apply_rotary_pos_emb,
+                 'apply_module': lambda module: module, 'component': lambda name: lambda fn: fn}
     exec(compile(ast.Module(body=[helper, qkv], type_ignores=[]), str(path), 'exec'), namespace)
     return namespace['_apply_mla_rope'], namespace['get_query_key_value_tensors']
 

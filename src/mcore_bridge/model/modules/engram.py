@@ -12,7 +12,9 @@ from .engram_fp8 import Fp8EngramEmbedding, fp8_quant_declared
 
 try:
     from megatron.core.component_nvtx import component
-except ImportError:
+except ModuleNotFoundError as error:
+    if error.name != "megatron.core.component_nvtx":
+        raise
 
     def component(name: str):
         return lambda fn: fn
